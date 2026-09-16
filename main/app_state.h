@@ -3,6 +3,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "app_config.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -24,6 +26,8 @@ typedef enum {
 
 typedef struct {
     bool initialized;
+
+    char device_hostname[APP_DEVICE_HOSTNAME_MAX_LENGTH + 1U];
 
     bool ipv4_ready;
 
@@ -51,6 +55,8 @@ typedef struct {
 } app_state_snapshot_t;
 
 void app_state_init(void);
+
+void app_state_set_device_hostname(const char *hostname);
 
 void app_state_set_ipv4_ready(bool ready);
 

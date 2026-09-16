@@ -169,6 +169,7 @@ static esp_err_t send_status_json(httpd_req_t *request)
         "\"unix_time\":%" PRId64
         "},"
         "\"device\":{"
+        "\"hostname\":\"%s\","
         "\"ipv4_ready\":%s,"
         "\"ipv4\":\"" IPSTR "\","
         "\"netmask\":\"" IPSTR "\","
@@ -233,6 +234,7 @@ static esp_err_t send_status_json(httpd_req_t *request)
         current_time_valid ? "true" : "false",
         unix_now,
 
+        app_status.device_hostname,
         eth_status.ipv4_ready ? "true" : "false",
         IP2STR(&device_ip),
         IP2STR(&netmask),
@@ -323,16 +325,33 @@ static esp_err_t send_health_response(httpd_req_t *request)
         clock_is_servable(clock_status.state,
                           clock_status.solution_valid);
 
-    httpd_resp_set_type(request, "text/plain");
-    set_security_headers(request);
+    app_state_snapshot_t app_status;
+    (void)app_state_get_snapshot(&app_status);
 
-    if (healthy) {
-        httpd_resp_set_status(request, "200 OK");
-        return httpd_resp_sendstr(request, "ok\n");
+    char response[256];
+    const int length = snprintf(
+        response,
+        sizeof(response),
+        "{\"status\":\"%s\",\"hostname\":\"%s\",\"ntp_ready\":%s}\n",
+        healthy ? "ok" : "not-ready",
+        app_status.device_hostname,
+        healthy ? "true" : "false");
+
+    if (length < 0 || length >= (int)sizeof(response)) {
+        return httpd_resp_send_err(request,
+                                   HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "health serialization failed");
     }
 
-    httpd_resp_set_status(request, "503 Service Unavailable");
-    return httpd_resp_sendstr(request, "not-ready\n");
+    httpd_resp_set_type(request, "application/json");
+    set_security_headers(request);
+
+    httpd_resp_set_status(request,
+                          healthy ? "200 OK" : "503 Service Unavailable");
+
+    return httpd_resp_send(request,
+                           response,
+                           HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t send_metrics_response(httpd_req_t *request)
@@ -541,6 +560,7 @@ static esp_err_t index_handler(httpd_req_t *request)
         "row('Queue Drops',d.pps.queue_drops)"
         "]));"
         "c.push(card('Network',["
+        "row('Hostname',d.device.hostname),"
         "row('IPv4 Address',d.device.ipv4),"
         "row('Netmask',d.device.netmask),"
         "row('Gateway',d.device.gateway),"
