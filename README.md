@@ -599,4 +599,4 @@ Potential future NTS work:
 7. Treat `HOLDOVER` as degraded service with increased root dispersion.
 8. Keep the web console read-only until authenticated management is implemented.
 9. Provide complete replacement files when modifying source.
-10. Do not claim a build or 
+10. Do not claim a build or test passed unless verified by actual build or test output.
