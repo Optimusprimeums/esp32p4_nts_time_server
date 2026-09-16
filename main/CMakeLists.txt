@@ -1,0 +1,33 @@
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "app_state.c"
+        "pps_service.c"
+        "gnss_service.c"
+        "clock_discipline.c"
+        "diagnostics.c"
+        "eth_service.c"
+        "ntp_packet.c"
+        "ntp_rate_limit.c"
+        "ntp_server.c"
+        "web_console.c"
+
+    INCLUDE_DIRS
+        "."
+
+    REQUIRES
+        esp_eth
+        esp_event
+        esp_netif
+        esp_timer
+        esp_http_server
+        esp_driver_gpio
+        esp_driver_gptimer
+        esp_driver_uart
+        esp_hw_support
+        nvs_flash
+        freertos
+        lwip
+        log
+        espressif__ip101
+)

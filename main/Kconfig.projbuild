@@ -1,0 +1,145 @@
+menu "ESP32-P4 NTP/NTS Time Server"
+
+config APP_ETH_PHY_ADDR
+    int "IP101 PHY address"
+    range 0 31
+    default 1
+
+config APP_ETH_MDC_GPIO
+    int "Ethernet MDC GPIO"
+    default 31
+
+config APP_ETH_MDIO_GPIO
+    int "Ethernet MDIO GPIO"
+    default 52
+
+config APP_ETH_PHY_RESET_GPIO
+    int "Ethernet PHY reset GPIO"
+    default 51
+
+config APP_PPS_GPIO
+    int "GNSS 1PPS GPIO"
+    default 5
+
+config APP_GNSS_UART_NUM
+    int "GNSS UART controller"
+    range 0 9
+    default 1
+
+config APP_GNSS_UART_RX_GPIO
+    int "GNSS UART RX GPIO"
+    default 2
+
+config APP_GNSS_UART_TX_GPIO
+    int "GNSS UART TX GPIO"
+    default 3
+
+config APP_GNSS_UART_BAUD
+    int "GNSS UART baud rate"
+    range 9600 921600
+    default 115200
+
+config APP_NTP_PORT
+    int "NTP UDP port"
+    range 1 65535
+    default 123
+
+config APP_NTS_KE_PORT
+    int "NTS-KE TCP port"
+    range 1 65535
+    default 4460
+
+config APP_NTP_MAX_CLIENTS
+    int "Maximum tracked NTP clients"
+    range 16 512
+    default 64
+
+config APP_NTP_RATE_BURST
+    int "Per-client token burst allowance"
+    range 1 64
+    default 8
+
+config APP_NTP_RATE_PER_MINUTE
+    int "Per-client requests per minute"
+    range 1 600
+    default 60
+
+config APP_CLOCK_LOCK_SAMPLES
+    int "Consecutive valid PPS samples required for lock"
+    range 3 3600
+    default 32
+
+config APP_HOLDOVER_MAX_SECONDS
+    int "Maximum holdover duration in seconds"
+    range 1 86400
+    default 3600
+
+
+
+config APP_CERT_PARTITION_LABEL
+    string "NVS partition label for TLS and NTS protected data"
+    default "nvs_certs"
+
+config APP_NVS_NAMESPACE
+    string "NVS namespace for protected time-service data"
+    default "nts_time"
+
+config APP_NTS_COOKIE_LIFETIME_SECONDS
+    int "NTS cookie lifetime in seconds"
+    range 60 2592000
+    default 86400
+
+config APP_NTS_MAX_COOKIE_COUNT
+    int "Maximum cookies returned by NTS-KE"
+    range 1 8
+    default 4
+
+config APP_NTS_MAX_PACKET_SIZE
+    int "Maximum accepted NTS packet size"
+    range 128 2048
+    default 512
+
+config APP_ENABLE_NTS
+    bool "Enable Network Time Security"
+    default n
+    help
+        Keep disabled until PSA Crypto AES-SIV, NTS cookies,
+        authenticated NTP extension handling, TLS 1.3 NTS-KE,
+        ALPN ntske/1, and interoperability testing are complete.
+
+config APP_ENABLE_INTERLEAVED
+    bool "Enable NTP interleaved mode"
+    default n
+    help
+        Keep disabled until supported hardware RX/TX timestamp
+        association is implemented and externally verified.
+
+config APP_ENABLE_SYMMETRIC_PEER
+    bool "Enable symmetric NTP peer support"
+    default n
+
+config APP_ENABLE_ACME_DNS01
+    bool "Enable ACME DNS-01 service"
+    default n
+
+config APP_ENABLE_WEB_CONSOLE
+    bool "Enable HTTPS management console"
+    default n
+
+config APP_ENABLE_MANAGEMENT_API
+    bool "Enable management API"
+    default n
+
+config APP_ENABLE_NTS_UART_PROVISIONING
+    bool "Enable temporary UART NTS provisioning"
+    default n
+    help
+        Enables local UART commands for TLS certificate and private-key
+        provisioning. Disable after provisioning is complete.
+
+config APP_NTS_PROVISION_UART
+    int "UART used for temporary NTS provisioning"
+    range 0 9
+    default 0
+
+endmenu

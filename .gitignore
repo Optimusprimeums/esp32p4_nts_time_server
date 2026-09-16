@@ -1,0 +1,19 @@
+# ESP-IDF build products
+/build/
+/sdkconfig
+/sdkconfig.old
+
+# Editor and operating-system files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Never place secrets, signing keys, or device certificates in Git.
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
