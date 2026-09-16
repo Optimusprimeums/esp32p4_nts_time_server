@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "app_main.c"
         "app_state.c"
+        "device_config.c"
         "pps_service.c"
         "gnss_service.c"
         "clock_discipline.c"
