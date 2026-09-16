@@ -17,18 +17,24 @@
 
 #include "esp_err.h"
 #include "esp_http_server.h"
+#include "esp_https_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 
 static const char *TAG = "WEB";
 
-#define APP_WEB_CONSOLE_PORT                    80U
+#define APP_WEB_CONSOLE_PORT                    443U
 #define APP_WEB_CONSOLE_STACK_SIZE              8192U
 #define APP_WEB_CONSOLE_MAX_HANDLERS            8U
 #define APP_WEB_CONSOLE_MAX_OPEN_SOCKETS        4U
 
 static httpd_handle_t s_server;
 static bool s_started;
+
+extern const unsigned char servercert_pem_start[] asm("_binary_servercert_pem_start");
+extern const unsigned char servercert_pem_end[] asm("_binary_servercert_pem_end");
+extern const unsigned char serverkey_pem_start[] asm("_binary_serverkey_pem_start");
+extern const unsigned char serverkey_pem_end[] asm("_binary_serverkey_pem_end");
 
 static const char *clock_state_to_string(app_clock_state_t state)
 {
@@ -160,7 +166,7 @@ static esp_err_t send_status_json(httpd_req_t *request)
         sizeof(response),
         "{"
         "\"console\":{"
-        "\"mode\":\"read_only\","
+        "\"mode\":\"read_only_https\","
         "\"port\":%u"
         "},"
         "\"readiness\":{"
@@ -491,13 +497,13 @@ static esp_err_t index_handler(httpd_req_t *request)
         "<body>"
         "<header>"
         "<h1>ESP32-P4 GNSS NTP Server</h1>"
-        "<p>Read-only operational console &middot; automatic refresh every three seconds</p>"
+        "<p>Read-only HTTPS operational console &middot; automatic refresh every three seconds</p>"
         "</header>"
         "<main>"
         "<div class=\"summary\" id=\"summary\"></div>"
         "<div class=\"grid\" id=\"cards\"></div>"
         "<footer>"
-        "Read-only endpoints: <code>/api/v1/status</code> &middot; "
+        "Read-only HTTPS endpoints: <code>/api/v1/status</code> &middot; "
         "<code>/api/v1/health</code> &middot; <code>/metrics</code>"
         "</footer>"
         "</main>"
@@ -647,15 +653,20 @@ esp_err_t web_console_start(void)
         return ESP_OK;
     }
 
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    httpd_ssl_config_t config = HTTPD_SSL_CONFIG_DEFAULT();
 
-    config.server_port = APP_WEB_CONSOLE_PORT;
-    config.stack_size = APP_WEB_CONSOLE_STACK_SIZE;
-    config.max_uri_handlers = APP_WEB_CONSOLE_MAX_HANDLERS;
-    config.max_open_sockets = APP_WEB_CONSOLE_MAX_OPEN_SOCKETS;
-    config.lru_purge_enable = true;
+    config.httpd.stack_size = APP_WEB_CONSOLE_STACK_SIZE;
+    config.httpd.max_uri_handlers = APP_WEB_CONSOLE_MAX_HANDLERS;
+    config.httpd.max_open_sockets = APP_WEB_CONSOLE_MAX_OPEN_SOCKETS;
+    config.httpd.lru_purge_enable = true;
+    config.transport_mode = HTTPD_SSL_TRANSPORT_SECURE;
+    config.port_secure = APP_WEB_CONSOLE_PORT;
+    config.servercert = servercert_pem_start;
+    config.servercert_len = (size_t)(servercert_pem_end - servercert_pem_start);
+    config.prvtkey_pem = serverkey_pem_start;
+    config.prvtkey_len = (size_t)(serverkey_pem_end - serverkey_pem_start);
 
-    esp_err_t err = httpd_start(&s_server, &config);
+    esp_err_t err = httpd_ssl_start(&s_server, &config);
 
     if (err != ESP_OK) {
         return err;
@@ -664,7 +675,7 @@ esp_err_t web_console_start(void)
     err = httpd_register_uri_handler(s_server, &s_index_uri);
 
     if (err != ESP_OK) {
-        (void)httpd_stop(s_server);
+        (void)httpd_ssl_stop(s_server);
         s_server = NULL;
         return err;
     }
@@ -672,7 +683,7 @@ esp_err_t web_console_start(void)
     err = httpd_register_uri_handler(s_server, &s_status_uri);
 
     if (err != ESP_OK) {
-        (void)httpd_stop(s_server);
+        (void)httpd_ssl_stop(s_server);
         s_server = NULL;
         return err;
     }
@@ -680,7 +691,7 @@ esp_err_t web_console_start(void)
     err = httpd_register_uri_handler(s_server, &s_health_uri);
 
     if (err != ESP_OK) {
-        (void)httpd_stop(s_server);
+        (void)httpd_ssl_stop(s_server);
         s_server = NULL;
         return err;
     }
@@ -688,7 +699,7 @@ esp_err_t web_console_start(void)
     err = httpd_register_uri_handler(s_server, &s_metrics_uri);
 
     if (err != ESP_OK) {
-        (void)httpd_stop(s_server);
+        (void)httpd_ssl_stop(s_server);
         s_server = NULL;
         return err;
     }
@@ -696,7 +707,7 @@ esp_err_t web_console_start(void)
     s_started = true;
 
     ESP_LOGW(TAG,
-             "Read-only HTTP console active on TCP/%u; "
+             "Read-only HTTPS console active on TCP/%u; "
              "restrict access to a trusted management network",
              APP_WEB_CONSOLE_PORT);
 

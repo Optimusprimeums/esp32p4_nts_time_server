@@ -22,6 +22,7 @@ idf_component_register(
         esp_netif
         esp_timer
         esp_http_server
+        esp_https_server
         esp_driver_gpio
         esp_driver_gptimer
         esp_driver_uart
@@ -31,4 +32,8 @@ idf_component_register(
         lwip
         log
         espressif__ip101
+
+    EMBED_TXTFILES
+        "servercert.pem"
+        "serverkey.pem"
 )

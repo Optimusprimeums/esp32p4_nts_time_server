@@ -141,5 +141,5 @@ void app_main(void)
     }
 
     ESP_LOGI(TAG,
-             "Ethernet, NTP, and read-only management console started");
+             "Ethernet, NTP, and read-only HTTPS management console started");
 }
