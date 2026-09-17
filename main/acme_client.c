@@ -20,6 +20,9 @@ static const char *TAG = "ACME";
 
 #define ACME_STAGING_DIRECTORY_URL \
     "https://acme-staging-v02.api.letsencrypt.org/directory"
+#define ACME_PRODUCTION_DIRECTORY_URL \
+    "https://acme-v02.api.letsencrypt.org/directory"
+#define ACME_PROD_ACCOUNT_NVS_KEY "acct_prod"
 
 #define ACME_RESPONSE_MAX      16384U
 #define ACME_NONCE_MAX           256U
@@ -54,6 +57,7 @@ typedef struct {
     acme_challenge_validation_t validation;
     acme_certificate_issue_status_t certificate;
     char requested_hostname[ACME_DNS_NAME_MAX_LENGTH + 1U];
+    bool production;
     esp_err_t result;
 } acme_worker_context_t;
 
@@ -242,7 +246,7 @@ static esp_err_t sha256_bytes(const void *data,
                : ESP_FAIL;
 }
 
-static esp_err_t probe_staging_sync(acme_directory_status_t *out_status)
+static esp_err_t probe_directory_sync(const char *directory_url, acme_directory_status_t *out_status)
 {
     if (out_status == NULL) return ESP_ERR_INVALID_ARG;
     memset(out_status, 0, sizeof(*out_status));
@@ -251,7 +255,7 @@ static esp_err_t probe_staging_sync(acme_directory_status_t *out_status)
     if (response == NULL) return ESP_ERR_NO_MEM;
 
     esp_http_client_config_t config = {
-        .url = ACME_STAGING_DIRECTORY_URL,
+        .url = directory_url,
         .event_handler = http_event_handler,
         .user_data = response,
         .crt_bundle_attach = esp_crt_bundle_attach,
@@ -336,6 +340,45 @@ static esp_err_t import_account_key(const uint8_t private_key[32],
     psa_reset_key_attributes(&attributes);
 
     return status == PSA_SUCCESS ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t probe_staging_sync(acme_directory_status_t *out_status)
+{
+    return probe_directory_sync(ACME_STAGING_DIRECTORY_URL, out_status);
+}
+
+static esp_err_t probe_production_sync(acme_directory_status_t *out_status)
+{
+    return probe_directory_sync(ACME_PRODUCTION_DIRECTORY_URL, out_status);
+}
+
+static esp_err_t load_production_account_url(char *url, size_t url_size)
+{
+    if (url == NULL || url_size < 2U) return ESP_ERR_INVALID_ARG;
+    esp_err_t err = acme_storage_init();
+    if (err != ESP_OK) return err;
+    nvs_handle_t handle;
+    err = nvs_open_from_partition("nvs_certs", "acme", NVS_READONLY, &handle);
+    if (err != ESP_OK) return err;
+    size_t len = url_size;
+    err = nvs_get_str(handle, ACME_PROD_ACCOUNT_NVS_KEY, url, &len);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_ERR_NOT_FOUND;
+    return err;
+}
+
+static esp_err_t store_production_account_url(const char *url)
+{
+    if (!is_https_url(url)) return ESP_ERR_INVALID_ARG;
+    esp_err_t err = acme_storage_init();
+    if (err != ESP_OK) return err;
+    nvs_handle_t handle;
+    err = nvs_open_from_partition("nvs_certs", "acme", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_str(handle, ACME_PROD_ACCOUNT_NVS_KEY, url);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return err;
 }
 
 static esp_err_t ensure_account_key(uint8_t private_key[32],
@@ -712,7 +755,7 @@ static esp_err_t account_status_local(acme_account_status_t *out_status)
     return err;
 }
 
-static esp_err_t provision_account_sync(acme_account_status_t *out_status)
+static esp_err_t provision_account_sync(bool production, acme_account_status_t *out_status)
 {
     if (out_status == NULL) return ESP_ERR_INVALID_ARG;
     memset(out_status, 0, sizeof(*out_status));
@@ -736,8 +779,8 @@ static esp_err_t provision_account_sync(acme_account_status_t *out_status)
     out_status->key_present = true;
 
     char existing_url[ACME_URL_MAX_LENGTH];
-    err = acme_storage_load_account_url(existing_url,
-                                        sizeof(existing_url));
+    err = production ? load_production_account_url(existing_url, sizeof(existing_url))
+                     : acme_storage_load_account_url(existing_url, sizeof(existing_url));
     if (err == ESP_OK && is_https_url(existing_url)) {
         out_status->registered = true;
         snprintf(out_status->account_url,
@@ -754,7 +797,7 @@ static esp_err_t provision_account_sync(acme_account_status_t *out_status)
     }
 
     acme_directory_status_t directory;
-    err = probe_staging_sync(&directory);
+    err = production ? probe_production_sync(&directory) : probe_staging_sync(&directory);
     if (err != ESP_OK) goto cleanup;
 
     char nonce[ACME_NONCE_MAX];
@@ -797,14 +840,16 @@ static esp_err_t provision_account_sync(acme_account_status_t *out_status)
     out_status->http_status = status;
 
     if (err == ESP_OK) {
-        err = acme_storage_store_account_url(response->location);
+        err = production ? store_production_account_url(response->location)
+                         : acme_storage_store_account_url(response->location);
         if (err == ESP_OK) {
             out_status->registered = true;
             snprintf(out_status->account_url,
                      sizeof(out_status->account_url),
                      "%s", response->location);
-            ESP_LOGI(TAG,
-                     "Let's Encrypt staging ACME account registered/recovered");
+            ESP_LOGI(TAG, "%s",
+                     production ? "Let's Encrypt production ACME account registered/recovered"
+                                : "Let's Encrypt staging ACME account registered/recovered");
         }
     }
 
@@ -993,7 +1038,7 @@ static esp_err_t signed_request(const char *nonce_url, const char *url,
     return err;
 }
 
-static esp_err_t discover_order_sync(const char *hostname, acme_order_discovery_t *out)
+static esp_err_t discover_order_sync(bool production, const char *hostname, acme_order_discovery_t *out)
 {
     if (hostname == NULL || out == NULL || !dns_name_is_valid(hostname)) return ESP_ERR_INVALID_ARG;
     memset(out, 0, sizeof(*out));
@@ -1005,11 +1050,11 @@ static esp_err_t discover_order_sync(const char *hostname, acme_order_discovery_
     err = acme_storage_load_private_key(private_key);
     if (err != ESP_OK) return err;
     char kid[ACME_URL_MAX_LENGTH];
-    err = acme_storage_load_account_url(kid, sizeof(kid));
+    err = production ? load_production_account_url(kid, sizeof(kid)) : acme_storage_load_account_url(kid, sizeof(kid));
     if (err != ESP_OK || !is_https_url(kid)) { memset(private_key, 0, sizeof(private_key)); return ESP_ERR_INVALID_STATE; }
 
     acme_directory_status_t directory;
-    err = probe_staging_sync(&directory);
+    err = production ? probe_production_sync(&directory) : probe_staging_sync(&directory);
     if (err != ESP_OK) goto cleanup;
 
     char payload[ACME_DNS_NAME_MAX_LENGTH + 96U];
@@ -1070,7 +1115,7 @@ static esp_err_t discover_order_sync(const char *hostname, acme_order_discovery_
                  "_acme-challenge.%s", hostname);
     if (n < 0 || n >= (int)sizeof(out->dns01_record_name)) { err = ESP_ERR_INVALID_SIZE; goto cleanup; }
     out->discovered = true;
-    ESP_LOGI(TAG, "Staging ACME order discovered for %s; challenge not triggered", hostname);
+    ESP_LOGI(TAG, "%s ACME order discovered for %s; challenge not triggered", production ? "Production" : "Staging", hostname);
 
 cleanup:
     memset(private_key, 0, sizeof(private_key));
@@ -1099,7 +1144,7 @@ static esp_err_t parse_authorization_status(const char *json,
     return ESP_OK;
 }
 
-static esp_err_t validate_dns01_sync(const acme_order_discovery_t *order,
+static esp_err_t validate_dns01_sync(bool production, const acme_order_discovery_t *order,
                                      acme_challenge_validation_t *out)
 {
     if (order == NULL || out == NULL || !order->discovered ||
@@ -1114,14 +1159,14 @@ static esp_err_t validate_dns01_sync(const acme_order_discovery_t *order,
     err = acme_storage_load_private_key(private_key);
     if (err != ESP_OK) return err;
     char kid[ACME_URL_MAX_LENGTH];
-    err = acme_storage_load_account_url(kid, sizeof(kid));
+    err = production ? load_production_account_url(kid, sizeof(kid)) : acme_storage_load_account_url(kid, sizeof(kid));
     if (err != ESP_OK || !is_https_url(kid)) {
         memset(private_key, 0, sizeof(private_key));
         return ESP_ERR_INVALID_STATE;
     }
 
     acme_directory_status_t directory;
-    err = probe_staging_sync(&directory);
+    err = production ? probe_production_sync(&directory) : probe_staging_sync(&directory);
     if (err != ESP_OK) goto cleanup;
 
     acme_response_buffer_t *response = calloc(1U, sizeof(*response));
@@ -1181,6 +1226,10 @@ cleanup:
 #define ACME_CERT_KEY_NVS_KEY "cert_key"
 #define ACME_CERT_PEM_NVS_KEY "cert_pem"
 #define ACME_CERT_HOST_NVS_KEY "cert_host"
+#define ACME_PROD_CERT_KEY_NVS_KEY "pcert_key"
+#define ACME_PROD_CERT_PEM_NVS_KEY "pcert_pem"
+#define ACME_PROD_CERT_HOST_NVS_KEY "pcert_host"
+#define ACME_TLS_BOOT_NVS_KEY "tls_prod"
 #define ACME_CERT_PRIVATE_KEY_LENGTH 32U
 #define ACME_CSR_MAX 1024U
 
@@ -1347,19 +1396,26 @@ static esp_err_t build_csr_der(const char *hostname, const uint8_t private_key[3
     return err;
 }
 
-static esp_err_t store_certificate_material(const char *hostname,
+static esp_err_t validate_certificate_material(const char *hostname, const uint8_t private_key[32], const char *pem, size_t pem_len);
+
+static esp_err_t store_certificate_material(bool production, const char *hostname,
                                             const uint8_t private_key[32],
                                             const char *pem, size_t pem_len)
 {
     if (!dns_name_is_valid(hostname) || private_key == NULL || pem == NULL || pem_len == 0U) return ESP_ERR_INVALID_ARG;
-    esp_err_t err = acme_storage_init();
+    esp_err_t err = validate_certificate_material(hostname, private_key, pem, pem_len);
+    if (err != ESP_OK) return err;
+    err = acme_storage_init();
     if (err != ESP_OK) return err;
     nvs_handle_t handle;
     err = nvs_open_from_partition("nvs_certs", "acme", NVS_READWRITE, &handle);
     if (err != ESP_OK) return err;
-    err = nvs_set_blob(handle, ACME_CERT_KEY_NVS_KEY, private_key, 32U);
-    if (err == ESP_OK) err = nvs_set_blob(handle, ACME_CERT_PEM_NVS_KEY, pem, pem_len + 1U);
-    if (err == ESP_OK) err = nvs_set_str(handle, ACME_CERT_HOST_NVS_KEY, hostname);
+    const char *key_name = production ? ACME_PROD_CERT_KEY_NVS_KEY : ACME_CERT_KEY_NVS_KEY;
+    const char *pem_name = production ? ACME_PROD_CERT_PEM_NVS_KEY : ACME_CERT_PEM_NVS_KEY;
+    const char *host_name = production ? ACME_PROD_CERT_HOST_NVS_KEY : ACME_CERT_HOST_NVS_KEY;
+    err = nvs_set_blob(handle, key_name, private_key, 32U);
+    if (err == ESP_OK) err = nvs_set_blob(handle, pem_name, pem, pem_len + 1U);
+    if (err == ESP_OK) err = nvs_set_str(handle, host_name, hostname);
     if (err == ESP_OK) err = nvs_commit(handle);
     nvs_close(handle);
     return err;
@@ -1387,6 +1443,27 @@ static bool bytes_contain(const unsigned char *haystack, size_t haystack_len,
         if (memcmp(haystack + i, needle, needle_len) == 0) return true;
     }
     return false;
+}
+
+static esp_err_t validate_certificate_material(const char *hostname, const uint8_t private_key[32],
+                                               const char *pem, size_t pem_len)
+{
+    if (!dns_name_is_valid(hostname) || private_key == NULL || pem == NULL || pem_len < 64U)
+        return ESP_ERR_INVALID_ARG;
+    mbedtls_x509_crt chain; mbedtls_x509_crt_init(&chain);
+    const int rc = mbedtls_x509_crt_parse(&chain, (const unsigned char *)pem, pem_len + 1U);
+    if (rc != 0 || chain.raw.p == NULL || chain.raw.len == 0U) { mbedtls_x509_crt_free(&chain); return ESP_ERR_INVALID_RESPONSE; }
+    if (!der_contains_dns_san(chain.raw.p, chain.raw.len, hostname)) { mbedtls_x509_crt_free(&chain); return ESP_ERR_INVALID_RESPONSE; }
+    psa_key_id_t key_id = 0;
+    esp_err_t err = import_account_key(private_key, PSA_KEY_USAGE_EXPORT, &key_id);
+    if (err != ESP_OK) { mbedtls_x509_crt_free(&chain); return err; }
+    uint8_t public_key[65]; size_t public_len = 0U;
+    const psa_status_t ps = psa_export_public_key(key_id, public_key, sizeof(public_key), &public_len);
+    (void)psa_destroy_key(key_id);
+    const bool match = ps == PSA_SUCCESS && public_len == sizeof(public_key) && public_key[0] == 0x04U &&
+                       bytes_contain(chain.raw.p, chain.raw.len, public_key, sizeof(public_key));
+    memset(public_key,0,sizeof(public_key)); mbedtls_x509_crt_free(&chain);
+    return match ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
 }
 
 static void fingerprint_hex(const uint8_t digest[32], char out[65])
@@ -1435,6 +1512,110 @@ esp_err_t acme_client_inspect_stored_certificate(acme_certificate_inspection_t *
     err = nvs_get_blob(handle, ACME_CERT_KEY_NVS_KEY, private_key, &read_key_len);
     if (err == ESP_OK) err = nvs_get_blob(handle, ACME_CERT_PEM_NVS_KEY, pem, &read_pem_len);
     if (err == ESP_OK) err = nvs_get_str(handle, ACME_CERT_HOST_NVS_KEY, hostname, &read_host_len);
+    nvs_close(handle);
+    if (err != ESP_OK) goto cleanup;
+    pem[pem_len] = '\0';
+
+    out_status->key_present = true;
+    out_status->certificate_present = true;
+    out_status->hostname_present = true;
+    out_status->certificate_pem_length = pem_len > 0U && pem[pem_len - 1U] == '\0' ? pem_len - 1U : pem_len;
+    snprintf(out_status->hostname, sizeof(out_status->hostname), "%s", hostname);
+
+    mbedtls_x509_crt chain;
+    mbedtls_x509_crt_init(&chain);
+    const int parse_rc = mbedtls_x509_crt_parse(&chain, (const unsigned char *)pem, pem_len);
+    if (parse_rc != 0) {
+        mbedtls_x509_crt_free(&chain);
+        err = ESP_ERR_INVALID_RESPONSE;
+        goto cleanup;
+    }
+    out_status->certificate_parse_valid = true;
+
+    unsigned count = 0U;
+    for (const mbedtls_x509_crt *crt = &chain; crt != NULL && crt->raw.p != NULL; crt = crt->next) ++count;
+    out_status->chain_certificate_count = count;
+
+    out_status->hostname_matches_certificate =
+        der_contains_dns_san(chain.raw.p, chain.raw.len, hostname);
+
+    uint8_t digest[32];
+    err = sha256_bytes(chain.raw.p, chain.raw.len, digest);
+    if (err == ESP_OK) fingerprint_hex(digest, out_status->leaf_sha256);
+    memset(digest, 0, sizeof(digest));
+    if (err != ESP_OK) { mbedtls_x509_crt_free(&chain); goto cleanup; }
+
+    snprintf(out_status->valid_from, sizeof(out_status->valid_from),
+             "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             chain.valid_from.year, chain.valid_from.mon, chain.valid_from.day,
+             chain.valid_from.hour, chain.valid_from.min, chain.valid_from.sec);
+    snprintf(out_status->valid_to, sizeof(out_status->valid_to),
+             "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             chain.valid_to.year, chain.valid_to.mon, chain.valid_to.day,
+             chain.valid_to.hour, chain.valid_to.min, chain.valid_to.sec);
+
+    psa_key_id_t key_id = 0;
+    err = import_account_key(private_key, PSA_KEY_USAGE_EXPORT, &key_id);
+    if (err == ESP_OK) {
+        uint8_t public_key[65]; size_t public_len = 0U;
+        const psa_status_t ps = psa_export_public_key(key_id, public_key, sizeof(public_key), &public_len);
+        (void)psa_destroy_key(key_id);
+        if (ps == PSA_SUCCESS && public_len == sizeof(public_key) && public_key[0] == 0x04U) {
+            out_status->private_key_matches_certificate =
+                bytes_contain(chain.raw.p, chain.raw.len, public_key, sizeof(public_key));
+        } else {
+            err = ESP_FAIL;
+        }
+        memset(public_key, 0, sizeof(public_key));
+    }
+    mbedtls_x509_crt_free(&chain);
+    if (err == ESP_OK && (!out_status->hostname_matches_certificate ||
+                          !out_status->private_key_matches_certificate)) {
+        err = ESP_ERR_INVALID_STATE;
+    }
+
+cleanup:
+    memset(private_key, 0, sizeof(private_key));
+    if (pem != NULL) { memset(pem, 0, pem_len + 1U); free(pem); }
+    return err;
+}
+
+esp_err_t acme_client_inspect_stored_production_certificate(acme_certificate_inspection_t *out_status)
+{
+    if (out_status == NULL) return ESP_ERR_INVALID_ARG;
+    memset(out_status, 0, sizeof(*out_status));
+
+    esp_err_t err = acme_storage_init();
+    if (err != ESP_OK) return err;
+
+    nvs_handle_t handle;
+    err = nvs_open_from_partition("nvs_certs", "acme", NVS_READONLY, &handle);
+    if (err != ESP_OK) return err;
+
+    size_t key_len = 0U, pem_len = 0U, host_len = 0U;
+    esp_err_t key_err = nvs_get_blob(handle, ACME_PROD_CERT_KEY_NVS_KEY, NULL, &key_len);
+    esp_err_t pem_err = nvs_get_blob(handle, ACME_PROD_CERT_PEM_NVS_KEY, NULL, &pem_len);
+    esp_err_t host_err = nvs_get_str(handle, ACME_PROD_CERT_HOST_NVS_KEY, NULL, &host_len);
+    if (key_err == ESP_ERR_NVS_NOT_FOUND || pem_err == ESP_ERR_NVS_NOT_FOUND ||
+        host_err == ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(handle);
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (key_err != ESP_OK || pem_err != ESP_OK || host_err != ESP_OK ||
+        key_len != ACME_CERT_PRIVATE_KEY_LENGTH || pem_len < 64U || pem_len > ACME_RESPONSE_MAX ||
+        host_len < 2U || host_len > ACME_DNS_NAME_MAX_LENGTH + 1U) {
+        nvs_close(handle);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint8_t private_key[ACME_CERT_PRIVATE_KEY_LENGTH];
+    char *pem = calloc(1U, pem_len + 1U);
+    if (pem == NULL) { nvs_close(handle); return ESP_ERR_NO_MEM; }
+    char hostname[ACME_DNS_NAME_MAX_LENGTH + 1U];
+    size_t read_key_len = sizeof(private_key), read_pem_len = pem_len, read_host_len = sizeof(hostname);
+    err = nvs_get_blob(handle, ACME_PROD_CERT_KEY_NVS_KEY, private_key, &read_key_len);
+    if (err == ESP_OK) err = nvs_get_blob(handle, ACME_PROD_CERT_PEM_NVS_KEY, pem, &read_pem_len);
+    if (err == ESP_OK) err = nvs_get_str(handle, ACME_PROD_CERT_HOST_NVS_KEY, hostname, &read_host_len);
     nvs_close(handle);
     if (err != ESP_OK) goto cleanup;
     pem[pem_len] = '\0';
@@ -1562,13 +1743,14 @@ void acme_client_free_tls_credentials(acme_tls_credentials_t *credentials)
     memset(credentials, 0, sizeof(*credentials));
 }
 
-esp_err_t acme_client_load_stored_tls_credentials(acme_tls_credentials_t *out_credentials)
+static esp_err_t load_tls_credentials(bool production, acme_tls_credentials_t *out_credentials)
 {
     if (out_credentials == NULL) return ESP_ERR_INVALID_ARG;
     memset(out_credentials, 0, sizeof(*out_credentials));
 
     acme_certificate_inspection_t inspection;
-    esp_err_t err = acme_client_inspect_stored_certificate(&inspection);
+    esp_err_t err = production ? acme_client_inspect_stored_production_certificate(&inspection)
+                               : acme_client_inspect_stored_certificate(&inspection);
     if (err != ESP_OK || !inspection.certificate_parse_valid ||
         !inspection.hostname_matches_certificate || !inspection.private_key_matches_certificate) {
         return err == ESP_OK ? ESP_ERR_INVALID_STATE : err;
@@ -1580,9 +1762,12 @@ esp_err_t acme_client_load_stored_tls_credentials(acme_tls_credentials_t *out_cr
     err = nvs_open_from_partition("nvs_certs", "acme", NVS_READONLY, &handle);
     if (err != ESP_OK) return err;
 
+    const char *key_name = production ? ACME_PROD_CERT_KEY_NVS_KEY : ACME_CERT_KEY_NVS_KEY;
+    const char *pem_name = production ? ACME_PROD_CERT_PEM_NVS_KEY : ACME_CERT_PEM_NVS_KEY;
+    const char *host_name = production ? ACME_PROD_CERT_HOST_NVS_KEY : ACME_CERT_HOST_NVS_KEY;
     size_t key_len = 0U, pem_len = 0U, host_len = sizeof(out_credentials->hostname);
-    err = nvs_get_blob(handle, ACME_CERT_KEY_NVS_KEY, NULL, &key_len);
-    if (err == ESP_OK) err = nvs_get_blob(handle, ACME_CERT_PEM_NVS_KEY, NULL, &pem_len);
+    err = nvs_get_blob(handle, key_name, NULL, &key_len);
+    if (err == ESP_OK) err = nvs_get_blob(handle, pem_name, NULL, &pem_len);
     if (err != ESP_OK || key_len != ACME_CERT_PRIVATE_KEY_LENGTH || pem_len < 64U || pem_len > ACME_RESPONSE_MAX) {
         nvs_close(handle); return err == ESP_OK ? ESP_ERR_INVALID_SIZE : err;
     }
@@ -1592,9 +1777,9 @@ esp_err_t acme_client_load_stored_tls_credentials(acme_tls_credentials_t *out_cr
     char *certificate = calloc(1U, pem_len + 1U);
     if (certificate == NULL) { nvs_close(handle); return ESP_ERR_NO_MEM; }
     size_t read_pem_len = pem_len;
-    err = nvs_get_blob(handle, ACME_CERT_KEY_NVS_KEY, private_key, &read_key_len);
-    if (err == ESP_OK) err = nvs_get_blob(handle, ACME_CERT_PEM_NVS_KEY, certificate, &read_pem_len);
-    if (err == ESP_OK) err = nvs_get_str(handle, ACME_CERT_HOST_NVS_KEY, out_credentials->hostname, &host_len);
+    err = nvs_get_blob(handle, key_name, private_key, &read_key_len);
+    if (err == ESP_OK) err = nvs_get_blob(handle, pem_name, certificate, &read_pem_len);
+    if (err == ESP_OK) err = nvs_get_str(handle, host_name, out_credentials->hostname, &host_len);
     nvs_close(handle);
     certificate[pem_len] = '\0';
     if (err != ESP_OK) { memset(private_key,0,sizeof(private_key)); memset(certificate,0,pem_len+1U); free(certificate); return err; }
@@ -1611,7 +1796,57 @@ esp_err_t acme_client_load_stored_tls_credentials(acme_tls_credentials_t *out_cr
     return ESP_OK;
 }
 
-static esp_err_t finalize_order_sync(const acme_order_discovery_t *order,
+esp_err_t acme_client_load_stored_tls_credentials(acme_tls_credentials_t *out_credentials)
+{
+    return load_tls_credentials(false, out_credentials);
+}
+
+esp_err_t acme_client_load_production_tls_credentials(acme_tls_credentials_t *out_credentials)
+{
+    return load_tls_credentials(true, out_credentials);
+}
+
+esp_err_t acme_client_get_production_boot_selected(bool *out_selected)
+{
+    if (out_selected == NULL) return ESP_ERR_INVALID_ARG;
+    *out_selected = false;
+    esp_err_t err = acme_storage_init();
+    if (err != ESP_OK) return err;
+    nvs_handle_t handle;
+    err = nvs_open_from_partition("nvs_certs", "acme", NVS_READONLY, &handle);
+    if (err != ESP_OK) return err;
+    uint8_t value = 0U;
+    err = nvs_get_u8(handle, ACME_TLS_BOOT_NVS_KEY, &value);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    if (err != ESP_OK) return err;
+    if (value > 1U) return ESP_ERR_INVALID_STATE;
+    *out_selected = value == 1U;
+    return ESP_OK;
+}
+
+esp_err_t acme_client_set_production_boot_selected(bool selected)
+{
+    esp_err_t err = acme_storage_init();
+    if (err != ESP_OK) return err;
+    if (selected) {
+        acme_certificate_inspection_t inspection;
+        err = acme_client_inspect_stored_production_certificate(&inspection);
+        if (err != ESP_OK || !inspection.certificate_parse_valid ||
+            !inspection.hostname_matches_certificate || !inspection.private_key_matches_certificate) {
+            return err == ESP_OK ? ESP_ERR_INVALID_STATE : err;
+        }
+    }
+    nvs_handle_t handle;
+    err = nvs_open_from_partition("nvs_certs", "acme", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(handle, ACME_TLS_BOOT_NVS_KEY, selected ? 1U : 0U);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return err;
+}
+
+static esp_err_t finalize_order_sync(bool production, const acme_order_discovery_t *order,
                                      acme_certificate_issue_status_t *out)
 {
     if (order == NULL || out == NULL || !order->discovered || !is_https_url(order->order_url) ||
@@ -1625,7 +1860,7 @@ static esp_err_t finalize_order_sync(const acme_order_discovery_t *order,
     err = acme_storage_load_private_key(account_key);
     if (err != ESP_OK) return err;
     char kid[ACME_URL_MAX_LENGTH];
-    err = acme_storage_load_account_url(kid, sizeof(kid));
+    err = production ? load_production_account_url(kid, sizeof(kid)) : acme_storage_load_account_url(kid, sizeof(kid));
     if (err != ESP_OK || !is_https_url(kid)) { memset(account_key,0,sizeof(account_key)); return ESP_ERR_INVALID_STATE; }
 
     uint8_t cert_key[32], public_key[65], csr[ACME_CSR_MAX]; size_t csr_len = 0U;
@@ -1646,7 +1881,7 @@ static esp_err_t finalize_order_sync(const acme_order_discovery_t *order,
     if (n < 0 || n >= (int)sizeof(payload)) { err = ESP_ERR_INVALID_SIZE; goto cleanup; }
 
     acme_directory_status_t directory;
-    err = probe_staging_sync(&directory);
+    err = production ? probe_production_sync(&directory) : probe_staging_sync(&directory);
     if (err != ESP_OK) goto cleanup;
     acme_response_buffer_t *response = calloc(1U, sizeof(*response));
     if (response == NULL) { err = ESP_ERR_NO_MEM; goto cleanup; }
@@ -1694,10 +1929,10 @@ static esp_err_t finalize_order_sync(const acme_order_discovery_t *order,
     }
     out->certificate_retrieved = true;
     out->certificate_pem_length = response->used;
-    err = store_certificate_material(order->identifier, cert_key, response->data, response->used);
+    err = store_certificate_material(production, order->identifier, cert_key, response->data, response->used);
     if (err == ESP_OK) {
         out->stored = true;
-        ESP_LOGI(TAG, "Stored staging certificate/key for %s in protected nvs_certs", order->identifier);
+        ESP_LOGI(TAG, "Stored %s certificate/key for %s in protected nvs_certs", production ? "production" : "staging", order->identifier);
     }
 
 response_cleanup:
@@ -1716,13 +1951,13 @@ static void acme_worker(void *argument)
     if (context->type == ACME_WORK_PROBE) {
         context->result = probe_staging_sync(&context->directory);
     } else if (context->type == ACME_WORK_PROVISION_ACCOUNT) {
-        context->result = provision_account_sync(&context->account);
+        context->result = provision_account_sync(context->production, &context->account);
     } else if (context->type == ACME_WORK_DISCOVER_ORDER) {
-        context->result = discover_order_sync(context->requested_hostname, &context->order);
+        context->result = discover_order_sync(context->production, context->requested_hostname, &context->order);
     } else if (context->type == ACME_WORK_VALIDATE_DNS01) {
-        context->result = validate_dns01_sync(&context->order, &context->validation);
+        context->result = validate_dns01_sync(context->production, &context->order, &context->validation);
     } else if (context->type == ACME_WORK_FINALIZE_ORDER) {
-        context->result = finalize_order_sync(&context->order, &context->certificate);
+        context->result = finalize_order_sync(context->production, &context->order, &context->certificate);
     } else {
         context->result = ESP_ERR_INVALID_ARG;
     }
@@ -1834,4 +2069,44 @@ esp_err_t acme_client_finalize_staging_order(const acme_order_discovery_t *order
     memset(context, 0, sizeof(*context));
     free(context);
     return result;
+}
+
+
+esp_err_t acme_client_provision_production_account(acme_account_status_t *out_status)
+{
+    if (out_status == NULL) return ESP_ERR_INVALID_ARG;
+    memset(out_status, 0, sizeof(*out_status));
+    acme_worker_context_t *context = calloc(1U, sizeof(*context));
+    if (context == NULL) return ESP_ERR_NO_MEM;
+    context->type = ACME_WORK_PROVISION_ACCOUNT; context->production = true;
+    esp_err_t result = run_worker(context); *out_status = context->account;
+    memset(context,0,sizeof(*context)); free(context); return result;
+}
+
+esp_err_t acme_client_discover_production_order(const char *hostname, acme_order_discovery_t *out_status)
+{
+    if (hostname == NULL || out_status == NULL || !dns_name_is_valid(hostname)) return ESP_ERR_INVALID_ARG;
+    memset(out_status,0,sizeof(*out_status));
+    acme_worker_context_t *context=calloc(1U,sizeof(*context)); if (!context) return ESP_ERR_NO_MEM;
+    context->type=ACME_WORK_DISCOVER_ORDER; context->production=true;
+    snprintf(context->requested_hostname,sizeof(context->requested_hostname),"%s",hostname);
+    esp_err_t result=run_worker(context); *out_status=context->order; memset(context,0,sizeof(*context)); free(context); return result;
+}
+
+esp_err_t acme_client_validate_production_dns01(const acme_order_discovery_t *order, acme_challenge_validation_t *out_status)
+{
+    if (order == NULL || out_status == NULL) return ESP_ERR_INVALID_ARG;
+    memset(out_status, 0, sizeof(*out_status));
+    acme_worker_context_t *context=calloc(1U,sizeof(*context)); if (!context) return ESP_ERR_NO_MEM;
+    context->type=ACME_WORK_VALIDATE_DNS01; context->production=true; context->order=*order;
+    esp_err_t result=run_worker(context); *out_status=context->validation; memset(context,0,sizeof(*context)); free(context); return result;
+}
+
+esp_err_t acme_client_finalize_production_order(const acme_order_discovery_t *order, acme_certificate_issue_status_t *out_status)
+{
+    if (order == NULL || out_status == NULL) return ESP_ERR_INVALID_ARG;
+    memset(out_status, 0, sizeof(*out_status));
+    acme_worker_context_t *context=calloc(1U,sizeof(*context)); if (!context) return ESP_ERR_NO_MEM;
+    context->type=ACME_WORK_FINALIZE_ORDER; context->production=true; context->order=*order;
+    esp_err_t result=run_worker(context); *out_status=context->certificate; memset(context,0,sizeof(*context)); free(context); return result;
 }

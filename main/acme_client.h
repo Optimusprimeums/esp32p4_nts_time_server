@@ -123,9 +123,25 @@ esp_err_t acme_client_finalize_staging_order(const acme_order_discovery_t *order
 /* Inspect protected stored certificate material without exposing the private key or PEM. */
 esp_err_t acme_client_inspect_stored_certificate(acme_certificate_inspection_t *out_status);
 
+/* Read-only inspection of separately stored production certificate material. */
+esp_err_t acme_client_inspect_stored_production_certificate(acme_certificate_inspection_t *out_status);
+
 /* Load validated stored TLS material for in-process server use. Never expose via HTTP. */
 esp_err_t acme_client_load_stored_tls_credentials(acme_tls_credentials_t *out_credentials);
+esp_err_t acme_client_load_production_tls_credentials(acme_tls_credentials_t *out_credentials);
 void acme_client_free_tls_credentials(acme_tls_credentials_t *credentials);
+
+/* Persisted boot TLS selection. Only production may be selected persistently. */
+esp_err_t acme_client_get_production_boot_selected(bool *out_selected);
+esp_err_t acme_client_set_production_boot_selected(bool selected);
+
+/* Phase 5B.8h production ACME APIs. Production account KID and certificate
+ * material are stored separately from staging state. These APIs never activate
+ * the resulting server credential. */
+esp_err_t acme_client_provision_production_account(acme_account_status_t *out_status);
+esp_err_t acme_client_discover_production_order(const char *hostname, acme_order_discovery_t *out_status);
+esp_err_t acme_client_validate_production_dns01(const acme_order_discovery_t *order, acme_challenge_validation_t *out_status);
+esp_err_t acme_client_finalize_production_order(const acme_order_discovery_t *order, acme_certificate_issue_status_t *out_status);
 
 #ifdef __cplusplus
 }

@@ -31,7 +31,7 @@ static const char *TAG = "WEB";
 
 #define APP_WEB_CONSOLE_PORT                    443U
 #define APP_WEB_CONSOLE_STACK_SIZE              8192U
-#define APP_WEB_CONSOLE_MAX_HANDLERS            21U
+#define APP_WEB_CONSOLE_MAX_HANDLERS            24U
 #define APP_WEB_CONFIG_BODY_MAX                  1024U
 #define APP_WEB_CONSOLE_MAX_OPEN_SOCKETS        4U
 
@@ -41,6 +41,7 @@ static bool s_started;
 typedef enum {
     WEB_TLS_EMBEDDED = 0,
     WEB_TLS_STORED_TEST,
+    WEB_TLS_PRODUCTION,
 } web_tls_source_t;
 
 static volatile bool s_tls_transition_pending;
@@ -49,6 +50,15 @@ static acme_tls_credentials_t s_active_stored_credentials;
 
 static esp_err_t start_https_server(web_tls_source_t source);
 static void tls_transition_task(void *arg);
+
+static const char *tls_source_name(web_tls_source_t source)
+{
+    switch (source) {
+    case WEB_TLS_STORED_TEST: return "stored_staging_test";
+    case WEB_TLS_PRODUCTION: return "stored_production";
+    default: return "embedded_development";
+    }
+}
 
 extern const unsigned char servercert_pem_start[] asm("_binary_servercert_pem_start");
 extern const unsigned char servercert_pem_end[] asm("_binary_servercert_pem_end");
@@ -1330,6 +1340,116 @@ static esp_err_t acme_staging_certificate_issue_handler(httpd_req_t *request)
 }
 
 
+static esp_err_t acme_production_certificate_issue_handler(httpd_req_t *request)
+{
+    char body[APP_WEB_CONFIG_BODY_MAX];
+    if (receive_request_body(request, body, sizeof(body)) != ESP_OK)
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid request body");
+    char hostname[ACME_DNS_NAME_MAX_LENGTH + 1U];
+    if (!extract_json_string(body, "hostname", hostname, sizeof(hostname))) {
+        memset(body,0,sizeof(body));
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "expected hostname");
+    }
+    memset(body,0,sizeof(body));
+
+    device_config_snapshot_t config;
+    esp_err_t err = device_config_get_snapshot(&config);
+    if (err != ESP_OK) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "configuration unavailable");
+    if (!config.cloudflare_configured) {
+        httpd_resp_set_status(request, "409 Conflict");
+        return httpd_resp_send(request, "Cloudflare is not configured", HTTPD_RESP_USE_STRLEN);
+    }
+    if (!hostname_in_zone(hostname, config.cloudflare_zone_name))
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
+                                   "hostname must be the configured Cloudflare zone or a subdomain");
+
+    device_config_cloudflare_credentials_t credentials;
+    err = device_config_get_cloudflare_credentials(&credentials);
+    if (err != ESP_OK) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                                   "Cloudflare credentials unavailable");
+
+    acme_account_status_t production_account; memset(&production_account,0,sizeof(production_account));
+    err = acme_client_provision_production_account(&production_account);
+    if (err != ESP_OK || !production_account.registered) {
+        memset(credentials.api_token,0,sizeof(credentials.api_token));
+        httpd_resp_set_status(request,"502 Bad Gateway");
+        return httpd_resp_send(request,"ACME production account provisioning failed",HTTPD_RESP_USE_STRLEN);
+    }
+
+    acme_order_discovery_t order;
+    err = acme_client_discover_production_order(hostname, &order);
+    if (err != ESP_OK) {
+        memset(credentials.api_token,0,sizeof(credentials.api_token));
+        httpd_resp_set_status(request,"502 Bad Gateway");
+        return httpd_resp_send(request,"ACME order discovery failed",HTTPD_RESP_USE_STRLEN);
+    }
+
+    char record_id[CLOUDFLARE_DNS_RECORD_ID_LENGTH + 1U] = {0};
+    int cf_create_status=0, cf_verify_status=0, cf_delete_status=0;
+    bool dns_created=false, dns_verified=false, dns_deleted=false;
+    err = cloudflare_client_create_dns01_txt(credentials.api_token, credentials.zone_id,
+                                              order.dns01_record_name, order.dns01_value,
+                                              record_id, sizeof(record_id), &cf_create_status);
+    if (err == ESP_OK) dns_created=true;
+    if (err == ESP_OK) {
+        err = cloudflare_client_verify_dns01_txt_content(credentials.api_token, credentials.zone_id,
+                                                          record_id, order.dns01_record_name,
+                                                          order.dns01_value, &cf_verify_status);
+        if (err == ESP_OK) dns_verified=true;
+    }
+
+    acme_challenge_validation_t validation; memset(&validation,0,sizeof(validation));
+    esp_err_t validation_err=err;
+    if (dns_verified) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+        validation_err=acme_client_validate_production_dns01(&order,&validation);
+    }
+
+    if (dns_created) {
+        const esp_err_t delete_err=cloudflare_client_delete_dns01_txt(credentials.api_token,
+            credentials.zone_id, record_id, order.dns01_record_name, &cf_delete_status);
+        dns_deleted=(delete_err==ESP_OK);
+        if (delete_err != ESP_OK) ESP_LOGE(TAG,"ACME DNS-01 cleanup failed: %s http=%d record_id=%s",
+                                           esp_err_to_name(delete_err),cf_delete_status,record_id);
+    }
+    memset(credentials.api_token,0,sizeof(credentials.api_token));
+
+    acme_certificate_issue_status_t certificate; memset(&certificate,0,sizeof(certificate));
+    esp_err_t certificate_err = validation_err;
+    if (validation_err == ESP_OK && validation.valid && dns_deleted)
+        certificate_err = acme_client_finalize_production_order(&order, &certificate);
+
+    char *response=calloc(1U,4096U);
+    if (response==NULL) return httpd_resp_send_err(request,HTTPD_500_INTERNAL_SERVER_ERROR,"out of memory");
+    const int length=snprintf(response,4096U,
+        "{\"environment\":\"production\",\"account_url\":\"%s\",\"identifier\":\"%s\"," 
+        "\"order_url\":\"%s\"," 
+        "\"dns01\":{\"record_name\":\"%s\",\"record_id\":\"%s\","
+        "\"created\":%s,\"content_verified\":%s,\"deleted\":%s,"
+        "\"create_http_status\":%d,\"verify_http_status\":%d,\"delete_http_status\":%d},"
+        "\"challenge\":{\"valid\":%s,\"authorization_status\":\"%s\"},"
+        "\"certificate\":{\"finalized\":%s,\"retrieved\":%s,\"stored\":%s,"
+        "\"finalize_http_status\":%d,\"order_poll_http_status\":%d,\"order_poll_count\":%u,"
+        "\"order_status\":\"%s\",\"certificate_http_status\":%d,"
+        "\"certificate_url\":\"%s\",\"pem_length\":%u},"
+        "\"active_management_tls_changed\":false}\n",
+        production_account.account_url,order.identifier,order.order_url,order.dns01_record_name,record_id,
+        dns_created?"true":"false",dns_verified?"true":"false",dns_deleted?"true":"false",
+        cf_create_status,cf_verify_status,cf_delete_status,
+        validation.valid?"true":"false",validation.authorization_status,
+        certificate.finalized?"true":"false",certificate.certificate_retrieved?"true":"false",
+        certificate.stored?"true":"false",certificate.finalize_http_status,
+        certificate.order_poll_http_status,certificate.order_poll_count,certificate.order_status,
+        certificate.certificate_http_status,certificate.certificate_url,
+        (unsigned)certificate.certificate_pem_length);
+    if (length<0 || length>=4096) { memset(response,0,4096U); free(response); return httpd_resp_send_err(request,HTTPD_500_INTERNAL_SERVER_ERROR,"ACME certificate serialization failed"); }
+    httpd_resp_set_type(request,"application/json"); set_security_headers(request);
+    if (certificate_err != ESP_OK || !certificate.stored) httpd_resp_set_status(request,"502 Bad Gateway");
+    const esp_err_t send_err=httpd_resp_send(request,response,HTTPD_RESP_USE_STRLEN);
+    memset(response,0,4096U); free(response); return send_err;
+}
+
+
 
 static esp_err_t acme_certificate_inspection_handler(httpd_req_t *request)
 {
@@ -1364,8 +1484,8 @@ static esp_err_t acme_certificate_inspection_handler(httpd_req_t *request)
         status.chain_certificate_count,
         (unsigned)status.certificate_pem_length,
         status.valid_from, status.valid_to, status.leaf_sha256,
-        s_tls_source == WEB_TLS_STORED_TEST ? "true" : "false",
-        s_tls_source == WEB_TLS_STORED_TEST ? "stored_staging_test" : "embedded_development");
+        s_tls_source != WEB_TLS_EMBEDDED ? "true" : "false",
+        tls_source_name(s_tls_source));
     if (length < 0 || length >= (int)sizeof(response))
         return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "serialization failed");
     httpd_resp_set_type(request, "application/json");
@@ -1373,6 +1493,54 @@ static esp_err_t acme_certificate_inspection_handler(httpd_req_t *request)
     if (err == ESP_ERR_INVALID_STATE) httpd_resp_set_status(request, "409 Conflict");
     return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
 }
+
+static esp_err_t acme_production_certificate_inspection_handler(httpd_req_t *request)
+{
+    acme_certificate_inspection_t status;
+    const esp_err_t err = acme_client_inspect_stored_production_certificate(&status);
+    if (err == ESP_ERR_NOT_FOUND) {
+        httpd_resp_set_status(request, "404 Not Found");
+        httpd_resp_set_type(request, "application/json");
+        set_security_headers(request);
+        return httpd_resp_send(request,
+                               "{\"stored\":false,\"environment\":\"production\",\"active_management_tls_changed\":false,\"active_tls_source\":\"embedded_development\"}\n",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "Stored production certificate inspection failed: %s", esp_err_to_name(err));
+        httpd_resp_set_status(request, "500 Internal Server Error");
+        return httpd_resp_send(request, "Stored production certificate inspection failed", HTTPD_RESP_USE_STRLEN);
+    }
+
+    char response[1024];
+    const int length = snprintf(response, sizeof(response),
+        "{\"stored\":true,\"environment\":\"production\",\"hostname\":\"%s\","
+        "\"key_present\":%s,\"certificate_present\":%s,\"hostname_present\":%s,"
+        "\"certificate_parse_valid\":%s,\"hostname_matches_certificate\":%s,"
+        "\"private_key_matches_certificate\":%s,\"chain_certificate_count\":%u,"
+        "\"pem_length\":%u,\"valid_from\":\"%s\",\"valid_to\":\"%s\","
+        "\"leaf_sha256\":\"%s\",\"active_management_tls_changed\":%s,"
+        "\"active_tls_source\":\"%s\"}\n",
+        status.hostname,
+        status.key_present ? "true" : "false",
+        status.certificate_present ? "true" : "false",
+        status.hostname_present ? "true" : "false",
+        status.certificate_parse_valid ? "true" : "false",
+        status.hostname_matches_certificate ? "true" : "false",
+        status.private_key_matches_certificate ? "true" : "false",
+        status.chain_certificate_count,
+        (unsigned)status.certificate_pem_length,
+        status.valid_from, status.valid_to, status.leaf_sha256,
+        s_tls_source != WEB_TLS_EMBEDDED ? "true" : "false",
+        tls_source_name(s_tls_source));
+    if (length < 0 || length >= (int)sizeof(response))
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "serialization failed");
+    httpd_resp_set_type(request, "application/json");
+    set_security_headers(request);
+    if (err == ESP_ERR_INVALID_STATE) httpd_resp_set_status(request, "409 Conflict");
+    return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+}
+
 
 static esp_err_t acme_certificate_activate_test_handler(httpd_req_t *request)
 {
@@ -1404,6 +1572,38 @@ static esp_err_t acme_certificate_activate_test_handler(httpd_req_t *request)
         HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t acme_production_certificate_activate_handler(httpd_req_t *request)
+{
+    if (s_tls_transition_pending) {
+        httpd_resp_set_status(request, "409 Conflict");
+        return httpd_resp_send(request, "TLS transition already pending", HTTPD_RESP_USE_STRLEN);
+    }
+    acme_certificate_inspection_t inspection;
+    const esp_err_t inspect_err = acme_client_inspect_stored_production_certificate(&inspection);
+    if (inspect_err != ESP_OK || !inspection.certificate_parse_valid ||
+        !inspection.hostname_matches_certificate || !inspection.private_key_matches_certificate) {
+        httpd_resp_set_status(request, "409 Conflict");
+        return httpd_resp_send(request, "Production certificate is not eligible for activation", HTTPD_RESP_USE_STRLEN);
+    }
+    if (s_tls_source == WEB_TLS_PRODUCTION) {
+        esp_err_t err = acme_client_set_production_boot_selected(true);
+        if (err != ESP_OK) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "unable to persist production TLS boot selection");
+        httpd_resp_set_type(request, "application/json"); set_security_headers(request);
+        return httpd_resp_send(request, "{\"scheduled\":false,\"active_tls_source\":\"stored_production\",\"persistent\":true}\n", HTTPD_RESP_USE_STRLEN);
+    }
+    s_tls_transition_pending = true;
+    if (xTaskCreate(tls_transition_task, "tls_prod", 8192U,
+                    (void *)(uintptr_t)WEB_TLS_PRODUCTION, 5U, NULL) != pdPASS) {
+        s_tls_transition_pending = false;
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "unable to schedule production TLS activation");
+    }
+    httpd_resp_set_status(request, "202 Accepted");
+    httpd_resp_set_type(request, "application/json"); set_security_headers(request);
+    return httpd_resp_send(request,
+        "{\"scheduled\":true,\"target_tls_source\":\"stored_production\",\"persistent\":true,\"management_client_ca_unchanged\":true}\n",
+        HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t acme_certificate_rollback_handler(httpd_req_t *request)
 {
     if (s_tls_transition_pending) {
@@ -1411,8 +1611,10 @@ static esp_err_t acme_certificate_rollback_handler(httpd_req_t *request)
         return httpd_resp_send(request, "TLS transition already pending", HTTPD_RESP_USE_STRLEN);
     }
     if (s_tls_source == WEB_TLS_EMBEDDED) {
+        const esp_err_t pref_err = acme_client_set_production_boot_selected(false);
+        if (pref_err != ESP_OK) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "unable to persist embedded TLS boot selection");
         httpd_resp_set_type(request, "application/json"); set_security_headers(request);
-        return httpd_resp_send(request, "{\"scheduled\":false,\"active_tls_source\":\"embedded_development\"}\n", HTTPD_RESP_USE_STRLEN);
+        return httpd_resp_send(request, "{\"scheduled\":false,\"active_tls_source\":\"embedded_development\",\"persistent\":true}\n", HTTPD_RESP_USE_STRLEN);
     }
     s_tls_transition_pending = true;
     if (xTaskCreate(tls_transition_task, "tls_rollback", 8192U,
@@ -1710,10 +1912,25 @@ static const httpd_uri_t s_acme_staging_certificate_issue_uri = {
 
 
 
+static const httpd_uri_t s_acme_production_certificate_issue_uri = {
+    .uri = "/api/v1/acme/production/certificate/issue",
+    .method = HTTP_POST,
+    .handler = acme_production_certificate_issue_handler,
+    .user_ctx = NULL,
+};
+
+
 static const httpd_uri_t s_acme_certificate_inspection_uri = {
     .uri = "/api/v1/acme/certificate",
     .method = HTTP_GET,
     .handler = acme_certificate_inspection_handler,
+    .user_ctx = NULL,
+};
+
+static const httpd_uri_t s_acme_production_certificate_inspection_uri = {
+    .uri = "/api/v1/acme/production/certificate",
+    .method = HTTP_GET,
+    .handler = acme_production_certificate_inspection_handler,
     .user_ctx = NULL,
 };
 
@@ -1722,6 +1939,12 @@ static const httpd_uri_t s_acme_certificate_activate_test_uri = {
     .method = HTTP_POST,
     .handler = acme_certificate_activate_test_handler,
     .user_ctx = NULL,
+};
+
+static const httpd_uri_t s_acme_production_certificate_activate_uri = {
+    .uri = "/api/v1/acme/production/certificate/activate",
+    .method = HTTP_POST,
+    .handler = acme_production_certificate_activate_handler,
 };
 
 static const httpd_uri_t s_acme_certificate_rollback_uri = {
@@ -1741,8 +1964,9 @@ static esp_err_t register_all_handlers(httpd_handle_t server)
         &s_acme_staging_probe_uri, &s_acme_account_status_uri,
         &s_acme_account_provision_uri, &s_acme_staging_order_discover_uri,
         &s_acme_staging_dns01_validate_uri, &s_acme_staging_certificate_issue_uri,
-        &s_acme_certificate_inspection_uri, &s_acme_certificate_activate_test_uri,
-        &s_acme_certificate_rollback_uri,
+        &s_acme_production_certificate_issue_uri, &s_acme_certificate_inspection_uri,
+        &s_acme_production_certificate_inspection_uri, &s_acme_certificate_activate_test_uri,
+        &s_acme_production_certificate_activate_uri, &s_acme_certificate_rollback_uri,
     };
     for (size_t i = 0U; i < sizeof(handlers) / sizeof(handlers[0]); ++i) {
         const esp_err_t err = httpd_register_uri_handler(server, handlers[i]);
@@ -1766,8 +1990,10 @@ static esp_err_t start_https_server(web_tls_source_t source)
     config.cacert_pem = management_ca_pem_start;
     config.cacert_len = (size_t)(management_ca_pem_end - management_ca_pem_start);
 
-    if (source == WEB_TLS_STORED_TEST) {
-        esp_err_t err = acme_client_load_stored_tls_credentials(&candidate);
+    if (source == WEB_TLS_STORED_TEST || source == WEB_TLS_PRODUCTION) {
+        esp_err_t err = source == WEB_TLS_PRODUCTION
+                            ? acme_client_load_production_tls_credentials(&candidate)
+                            : acme_client_load_stored_tls_credentials(&candidate);
         if (err != ESP_OK) return err;
         config.servercert = (const uint8_t *)candidate.certificate_pem;
         config.servercert_len = candidate.certificate_pem_length;
@@ -1792,13 +2018,13 @@ static esp_err_t start_https_server(web_tls_source_t source)
     s_server = server;
     s_started = true;
     s_tls_source = source;
-    if (source == WEB_TLS_STORED_TEST) {
+    if (source == WEB_TLS_STORED_TEST || source == WEB_TLS_PRODUCTION) {
         s_active_stored_credentials = candidate;
         memset(&candidate, 0, sizeof(candidate));
     }
     ESP_LOGW(TAG, "mTLS management console active on TCP/%u; server credential=%s; client certificate required",
              APP_WEB_CONSOLE_PORT,
-             source == WEB_TLS_STORED_TEST ? "stored staging test" : "embedded development");
+             tls_source_name(source));
     return ESP_OK;
 }
 
@@ -1812,19 +2038,33 @@ static void tls_transition_task(void *arg)
         s_server = NULL;
         s_started = false;
     }
-    if (s_tls_source == WEB_TLS_STORED_TEST) {
+    if (s_tls_source != WEB_TLS_EMBEDDED) {
         acme_client_free_tls_credentials(&s_active_stored_credentials);
     }
 
-    esp_err_t err = start_https_server(target);
-    if (err != ESP_OK && target != WEB_TLS_EMBEDDED) {
-        ESP_LOGE(TAG, "Stored TLS test activation failed: %s; rolling back to embedded credential",
-                 esp_err_to_name(err));
+    esp_err_t err;
+    if (target == WEB_TLS_EMBEDDED) {
+        const esp_err_t pref_err = acme_client_set_production_boot_selected(false);
+        if (pref_err != ESP_OK) ESP_LOGE(TAG, "Could not persist embedded TLS selection: %s", esp_err_to_name(pref_err));
         err = start_https_server(WEB_TLS_EMBEDDED);
+    } else {
+        err = start_https_server(target);
+        if (err == ESP_OK && target == WEB_TLS_PRODUCTION) {
+            err = acme_client_set_production_boot_selected(true);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Could not persist production TLS selection: %s; rolling back", esp_err_to_name(err));
+                if (s_server != NULL) { (void)httpd_ssl_stop(s_server); s_server = NULL; s_started = false; }
+                acme_client_free_tls_credentials(&s_active_stored_credentials);
+                (void)acme_client_set_production_boot_selected(false);
+            }
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Stored TLS activation failed: %s; rolling back to embedded credential", esp_err_to_name(err));
+            (void)acme_client_set_production_boot_selected(false);
+            err = start_https_server(WEB_TLS_EMBEDDED);
+        }
     }
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Management HTTPS restart failed: %s", esp_err_to_name(err));
-    }
+    if (err != ESP_OK) ESP_LOGE(TAG, "Management HTTPS restart failed: %s", esp_err_to_name(err));
     s_tls_transition_pending = false;
     vTaskDelete(NULL);
 }
@@ -1832,7 +2072,21 @@ static void tls_transition_task(void *arg)
 esp_err_t web_console_start(void)
 {
     if (s_started) return ESP_OK;
-    /* Fail-safe boot policy: always start with the embedded development credential. */
+    bool production_selected = false;
+    esp_err_t err = acme_client_get_production_boot_selected(&production_selected);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "TLS boot selection read failed: %s; using embedded credential", esp_err_to_name(err));
+        (void)acme_client_set_production_boot_selected(false);
+        return start_https_server(WEB_TLS_EMBEDDED);
+    }
+    if (!production_selected) return start_https_server(WEB_TLS_EMBEDDED);
+
+    err = start_https_server(WEB_TLS_PRODUCTION);
+    if (err == ESP_OK) return ESP_OK;
+
+    ESP_LOGE(TAG, "Production TLS boot failed: %s; clearing selection and falling back to embedded credential",
+             esp_err_to_name(err));
+    (void)acme_client_set_production_boot_selected(false);
     return start_https_server(WEB_TLS_EMBEDDED);
 }
 
