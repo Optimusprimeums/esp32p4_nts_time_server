@@ -31,12 +31,24 @@ static const char *TAG = "WEB";
 
 #define APP_WEB_CONSOLE_PORT                    443U
 #define APP_WEB_CONSOLE_STACK_SIZE              8192U
-#define APP_WEB_CONSOLE_MAX_HANDLERS            19U
+#define APP_WEB_CONSOLE_MAX_HANDLERS            21U
 #define APP_WEB_CONFIG_BODY_MAX                  1024U
 #define APP_WEB_CONSOLE_MAX_OPEN_SOCKETS        4U
 
 static httpd_handle_t s_server;
 static bool s_started;
+
+typedef enum {
+    WEB_TLS_EMBEDDED = 0,
+    WEB_TLS_STORED_TEST,
+} web_tls_source_t;
+
+static volatile bool s_tls_transition_pending;
+static web_tls_source_t s_tls_source = WEB_TLS_EMBEDDED;
+static acme_tls_credentials_t s_active_stored_credentials;
+
+static esp_err_t start_https_server(web_tls_source_t source);
+static void tls_transition_task(void *arg);
 
 extern const unsigned char servercert_pem_start[] asm("_binary_servercert_pem_start");
 extern const unsigned char servercert_pem_end[] asm("_binary_servercert_pem_end");
@@ -1340,7 +1352,8 @@ static esp_err_t acme_certificate_inspection_handler(httpd_req_t *request)
         "\"certificate_parse_valid\":%s,\"hostname_matches_certificate\":%s,"
         "\"private_key_matches_certificate\":%s,\"chain_certificate_count\":%u,"
         "\"pem_length\":%u,\"valid_from\":\"%s\",\"valid_to\":\"%s\","
-        "\"leaf_sha256\":\"%s\",\"active_management_tls_changed\":false}\n",
+        "\"leaf_sha256\":\"%s\",\"active_management_tls_changed\":%s,"
+        "\"active_tls_source\":\"%s\"}\n",
         status.hostname,
         status.key_present ? "true" : "false",
         status.certificate_present ? "true" : "false",
@@ -1350,13 +1363,68 @@ static esp_err_t acme_certificate_inspection_handler(httpd_req_t *request)
         status.private_key_matches_certificate ? "true" : "false",
         status.chain_certificate_count,
         (unsigned)status.certificate_pem_length,
-        status.valid_from, status.valid_to, status.leaf_sha256);
+        status.valid_from, status.valid_to, status.leaf_sha256,
+        s_tls_source == WEB_TLS_STORED_TEST ? "true" : "false",
+        s_tls_source == WEB_TLS_STORED_TEST ? "stored_staging_test" : "embedded_development");
     if (length < 0 || length >= (int)sizeof(response))
         return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "serialization failed");
     httpd_resp_set_type(request, "application/json");
     set_security_headers(request);
     if (err == ESP_ERR_INVALID_STATE) httpd_resp_set_status(request, "409 Conflict");
     return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t acme_certificate_activate_test_handler(httpd_req_t *request)
+{
+    if (s_tls_transition_pending) {
+        httpd_resp_set_status(request, "409 Conflict");
+        return httpd_resp_send(request, "TLS transition already pending", HTTPD_RESP_USE_STRLEN);
+    }
+    if (s_tls_source == WEB_TLS_STORED_TEST) {
+        httpd_resp_set_type(request, "application/json"); set_security_headers(request);
+        return httpd_resp_send(request, "{\"scheduled\":false,\"active_tls_source\":\"stored_staging_test\"}\n", HTTPD_RESP_USE_STRLEN);
+    }
+    acme_certificate_inspection_t inspection;
+    const esp_err_t inspect_err = acme_client_inspect_stored_certificate(&inspection);
+    if (inspect_err != ESP_OK || !inspection.certificate_parse_valid ||
+        !inspection.hostname_matches_certificate || !inspection.private_key_matches_certificate) {
+        httpd_resp_set_status(request, "409 Conflict");
+        return httpd_resp_send(request, "Stored certificate is not eligible for test activation", HTTPD_RESP_USE_STRLEN);
+    }
+    s_tls_transition_pending = true;
+    if (xTaskCreate(tls_transition_task, "tls_switch", 8192U,
+                    (void *)(uintptr_t)WEB_TLS_STORED_TEST, 5U, NULL) != pdPASS) {
+        s_tls_transition_pending = false;
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "unable to schedule TLS transition");
+    }
+    httpd_resp_set_status(request, "202 Accepted");
+    httpd_resp_set_type(request, "application/json"); set_security_headers(request);
+    return httpd_resp_send(request,
+        "{\"scheduled\":true,\"target_tls_source\":\"stored_staging_test\",\"persistent\":false,\"management_client_ca_unchanged\":true}\n",
+        HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t acme_certificate_rollback_handler(httpd_req_t *request)
+{
+    if (s_tls_transition_pending) {
+        httpd_resp_set_status(request, "409 Conflict");
+        return httpd_resp_send(request, "TLS transition already pending", HTTPD_RESP_USE_STRLEN);
+    }
+    if (s_tls_source == WEB_TLS_EMBEDDED) {
+        httpd_resp_set_type(request, "application/json"); set_security_headers(request);
+        return httpd_resp_send(request, "{\"scheduled\":false,\"active_tls_source\":\"embedded_development\"}\n", HTTPD_RESP_USE_STRLEN);
+    }
+    s_tls_transition_pending = true;
+    if (xTaskCreate(tls_transition_task, "tls_rollback", 8192U,
+                    (void *)(uintptr_t)WEB_TLS_EMBEDDED, 5U, NULL) != pdPASS) {
+        s_tls_transition_pending = false;
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "unable to schedule TLS rollback");
+    }
+    httpd_resp_set_status(request, "202 Accepted");
+    httpd_resp_set_type(request, "application/json"); set_security_headers(request);
+    return httpd_resp_send(request,
+        "{\"scheduled\":true,\"target_tls_source\":\"embedded_development\",\"management_client_ca_unchanged\":true}\n",
+        HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t index_handler(httpd_req_t *request)
@@ -1649,13 +1717,45 @@ static const httpd_uri_t s_acme_certificate_inspection_uri = {
     .user_ctx = NULL,
 };
 
-esp_err_t web_console_start(void)
-{
-    if (s_started) {
-        return ESP_OK;
-    }
+static const httpd_uri_t s_acme_certificate_activate_test_uri = {
+    .uri = "/api/v1/acme/certificate/activate-test",
+    .method = HTTP_POST,
+    .handler = acme_certificate_activate_test_handler,
+    .user_ctx = NULL,
+};
 
+static const httpd_uri_t s_acme_certificate_rollback_uri = {
+    .uri = "/api/v1/acme/certificate/rollback",
+    .method = HTTP_POST,
+    .handler = acme_certificate_rollback_handler,
+    .user_ctx = NULL,
+};
+
+static esp_err_t register_all_handlers(httpd_handle_t server)
+{
+    const httpd_uri_t *handlers[] = {
+        &s_index_uri, &s_status_uri, &s_health_uri, &s_metrics_uri,
+        &s_config_get_uri, &s_hostname_put_uri, &s_cloudflare_put_uri,
+        &s_cloudflare_delete_uri, &s_cloudflare_verify_uri,
+        &s_dns01_create_uri, &s_dns01_query_uri, &s_dns01_delete_uri,
+        &s_acme_staging_probe_uri, &s_acme_account_status_uri,
+        &s_acme_account_provision_uri, &s_acme_staging_order_discover_uri,
+        &s_acme_staging_dns01_validate_uri, &s_acme_staging_certificate_issue_uri,
+        &s_acme_certificate_inspection_uri, &s_acme_certificate_activate_test_uri,
+        &s_acme_certificate_rollback_uri,
+    };
+    for (size_t i = 0U; i < sizeof(handlers) / sizeof(handlers[0]); ++i) {
+        const esp_err_t err = httpd_register_uri_handler(server, handlers[i]);
+        if (err != ESP_OK) return err;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t start_https_server(web_tls_source_t source)
+{
     httpd_ssl_config_t config = HTTPD_SSL_CONFIG_DEFAULT();
+    acme_tls_credentials_t candidate;
+    memset(&candidate, 0, sizeof(candidate));
 
     config.httpd.stack_size = APP_WEB_CONSOLE_STACK_SIZE;
     config.httpd.max_uri_handlers = APP_WEB_CONSOLE_MAX_HANDLERS;
@@ -1663,102 +1763,77 @@ esp_err_t web_console_start(void)
     config.httpd.lru_purge_enable = true;
     config.transport_mode = HTTPD_SSL_TRANSPORT_SECURE;
     config.port_secure = APP_WEB_CONSOLE_PORT;
-    config.servercert = servercert_pem_start;
-    config.servercert_len = (size_t)(servercert_pem_end - servercert_pem_start);
-    config.prvtkey_pem = serverkey_pem_start;
-    config.prvtkey_len = (size_t)(serverkey_pem_end - serverkey_pem_start);
     config.cacert_pem = management_ca_pem_start;
     config.cacert_len = (size_t)(management_ca_pem_end - management_ca_pem_start);
 
-    esp_err_t err = httpd_ssl_start(&s_server, &config);
+    if (source == WEB_TLS_STORED_TEST) {
+        esp_err_t err = acme_client_load_stored_tls_credentials(&candidate);
+        if (err != ESP_OK) return err;
+        config.servercert = (const uint8_t *)candidate.certificate_pem;
+        config.servercert_len = candidate.certificate_pem_length;
+        config.prvtkey_pem = (const uint8_t *)candidate.private_key_pem;
+        config.prvtkey_len = candidate.private_key_pem_length;
+    } else {
+        config.servercert = servercert_pem_start;
+        config.servercert_len = (size_t)(servercert_pem_end - servercert_pem_start);
+        config.prvtkey_pem = serverkey_pem_start;
+        config.prvtkey_len = (size_t)(serverkey_pem_end - serverkey_pem_start);
+    }
 
+    httpd_handle_t server = NULL;
+    esp_err_t err = httpd_ssl_start(&server, &config);
+    if (err == ESP_OK) err = register_all_handlers(server);
     if (err != ESP_OK) {
+        if (server != NULL) (void)httpd_ssl_stop(server);
+        acme_client_free_tls_credentials(&candidate);
         return err;
     }
 
-    err = httpd_register_uri_handler(s_server, &s_index_uri);
-
-    if (err != ESP_OK) {
-        (void)httpd_ssl_stop(s_server);
-        s_server = NULL;
-        return err;
-    }
-
-    err = httpd_register_uri_handler(s_server, &s_status_uri);
-
-    if (err != ESP_OK) {
-        (void)httpd_ssl_stop(s_server);
-        s_server = NULL;
-        return err;
-    }
-
-    err = httpd_register_uri_handler(s_server, &s_health_uri);
-
-    if (err != ESP_OK) {
-        (void)httpd_ssl_stop(s_server);
-        s_server = NULL;
-        return err;
-    }
-
-    err = httpd_register_uri_handler(s_server, &s_metrics_uri);
-
-    if (err != ESP_OK) {
-        (void)httpd_ssl_stop(s_server);
-        s_server = NULL;
-        return err;
-    }
-
-    err = httpd_register_uri_handler(s_server, &s_config_get_uri);
-
-    if (err != ESP_OK) {
-        (void)httpd_ssl_stop(s_server);
-        s_server = NULL;
-        return err;
-    }
-
-    err = httpd_register_uri_handler(s_server, &s_hostname_put_uri);
-
-    if (err != ESP_OK) {
-        (void)httpd_ssl_stop(s_server);
-        s_server = NULL;
-        return err;
-    }
-
-    err = httpd_register_uri_handler(s_server, &s_cloudflare_put_uri);
-    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
-    err = httpd_register_uri_handler(s_server, &s_cloudflare_delete_uri);
-    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
-    err = httpd_register_uri_handler(s_server, &s_cloudflare_verify_uri);
-    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
-    err = httpd_register_uri_handler(s_server, &s_dns01_create_uri);
-    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
-    err = httpd_register_uri_handler(s_server, &s_dns01_query_uri);
-    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
-    err = httpd_register_uri_handler(s_server, &s_dns01_delete_uri);
-    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
-    err = httpd_register_uri_handler(s_server, &s_acme_staging_probe_uri);
-    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
-    err = httpd_register_uri_handler(s_server, &s_acme_account_status_uri);
-    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
-    err = httpd_register_uri_handler(s_server, &s_acme_account_provision_uri);
-    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
-    err = httpd_register_uri_handler(s_server, &s_acme_staging_order_discover_uri);
-    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
-    err = httpd_register_uri_handler(s_server, &s_acme_staging_dns01_validate_uri);
-    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
-    err = httpd_register_uri_handler(s_server, &s_acme_staging_certificate_issue_uri);
-    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
-    err = httpd_register_uri_handler(s_server, &s_acme_certificate_inspection_uri);
-    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
-
+    s_server = server;
     s_started = true;
-
-    ESP_LOGW(TAG,
-             "mTLS management console active on TCP/%u; "
-             "client certificate required",
-             APP_WEB_CONSOLE_PORT);
-
+    s_tls_source = source;
+    if (source == WEB_TLS_STORED_TEST) {
+        s_active_stored_credentials = candidate;
+        memset(&candidate, 0, sizeof(candidate));
+    }
+    ESP_LOGW(TAG, "mTLS management console active on TCP/%u; server credential=%s; client certificate required",
+             APP_WEB_CONSOLE_PORT,
+             source == WEB_TLS_STORED_TEST ? "stored staging test" : "embedded development");
     return ESP_OK;
+}
+
+static void tls_transition_task(void *arg)
+{
+    const web_tls_source_t target = (web_tls_source_t)(uintptr_t)arg;
+    vTaskDelay(pdMS_TO_TICKS(750));
+
+    if (s_server != NULL) {
+        (void)httpd_ssl_stop(s_server);
+        s_server = NULL;
+        s_started = false;
+    }
+    if (s_tls_source == WEB_TLS_STORED_TEST) {
+        acme_client_free_tls_credentials(&s_active_stored_credentials);
+    }
+
+    esp_err_t err = start_https_server(target);
+    if (err != ESP_OK && target != WEB_TLS_EMBEDDED) {
+        ESP_LOGE(TAG, "Stored TLS test activation failed: %s; rolling back to embedded credential",
+                 esp_err_to_name(err));
+        err = start_https_server(WEB_TLS_EMBEDDED);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Management HTTPS restart failed: %s", esp_err_to_name(err));
+    }
+    s_tls_transition_pending = false;
+    vTaskDelete(NULL);
+}
+
+esp_err_t web_console_start(void)
+{
+    if (s_started) return ESP_OK;
+    /* Fail-safe boot policy: always start with the embedded development credential. */
+    return start_https_server(WEB_TLS_EMBEDDED);
 }
 
 bool web_console_is_running(void)

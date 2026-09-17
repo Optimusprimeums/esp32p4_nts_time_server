@@ -23,6 +23,7 @@ typedef struct {
     char new_order_url[ACME_URL_MAX_LENGTH];
 } acme_directory_status_t;
 
+
 typedef struct {
     bool key_present;
     bool registered;
@@ -72,6 +73,15 @@ typedef struct {
 
 
 
+
+typedef struct {
+    char *certificate_pem;
+    size_t certificate_pem_length;
+    char *private_key_pem;
+    size_t private_key_pem_length;
+    char hostname[ACME_DNS_NAME_MAX_LENGTH + 1U];
+} acme_tls_credentials_t;
+
 typedef struct {
     bool key_present;
     bool certificate_present;
@@ -112,6 +122,10 @@ esp_err_t acme_client_finalize_staging_order(const acme_order_discovery_t *order
 
 /* Inspect protected stored certificate material without exposing the private key or PEM. */
 esp_err_t acme_client_inspect_stored_certificate(acme_certificate_inspection_t *out_status);
+
+/* Load validated stored TLS material for in-process server use. Never expose via HTTP. */
+esp_err_t acme_client_load_stored_tls_credentials(acme_tls_credentials_t *out_credentials);
+void acme_client_free_tls_credentials(acme_tls_credentials_t *credentials);
 
 #ifdef __cplusplus
 }

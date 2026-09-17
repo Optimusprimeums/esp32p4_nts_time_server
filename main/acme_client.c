@@ -1503,6 +1503,114 @@ cleanup:
     return err;
 }
 
+static const char s_b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static esp_err_t pem_encode_ec_private_key(const uint8_t private_key[32],
+                                           char **out_pem,
+                                           size_t *out_length)
+{
+    if (private_key == NULL || out_pem == NULL || out_length == NULL) return ESP_ERR_INVALID_ARG;
+    *out_pem = NULL; *out_length = 0U;
+
+    uint8_t der[51] = {
+        0x30,0x31,0x02,0x01,0x01,0x04,0x20,
+        /* 32-byte private scalar follows */
+    };
+    memcpy(der + 7U, private_key, 32U);
+    static const uint8_t suffix[] = {0xA0,0x0A,0x06,0x08,0x2A,0x86,0x48,0xCE,0x3D,0x03,0x01,0x07};
+    memcpy(der + 39U, suffix, sizeof(suffix));
+
+    char b64[69];
+    size_t o = 0U;
+    for (size_t i = 0U; i < sizeof(der); i += 3U) {
+        const uint32_t a = der[i];
+        const uint32_t b = i + 1U < sizeof(der) ? der[i + 1U] : 0U;
+        const uint32_t c = i + 2U < sizeof(der) ? der[i + 2U] : 0U;
+        const uint32_t v = (a << 16) | (b << 8) | c;
+        b64[o++] = s_b64[(v >> 18) & 63U];
+        b64[o++] = s_b64[(v >> 12) & 63U];
+        b64[o++] = i + 1U < sizeof(der) ? s_b64[(v >> 6) & 63U] : '=';
+        b64[o++] = i + 2U < sizeof(der) ? s_b64[v & 63U] : '=';
+    }
+    b64[o] = '\0';
+    memset(der, 0, sizeof(der));
+
+    const char *begin = "-----BEGIN EC PRIVATE KEY-----\n";
+    const char *end = "-----END EC PRIVATE KEY-----\n";
+    const size_t total = strlen(begin) + o + 1U + strlen(end) + 1U;
+    char *pem = calloc(1U, total);
+    if (pem == NULL) { memset(b64,0,sizeof(b64)); return ESP_ERR_NO_MEM; }
+    const int n = snprintf(pem, total, "%s%s\n%s", begin, b64, end);
+    memset(b64, 0, sizeof(b64));
+    if (n < 0 || (size_t)n >= total) { memset(pem,0,total); free(pem); return ESP_ERR_INVALID_SIZE; }
+    *out_pem = pem;
+    *out_length = (size_t)n + 1U;
+    return ESP_OK;
+}
+
+void acme_client_free_tls_credentials(acme_tls_credentials_t *credentials)
+{
+    if (credentials == NULL) return;
+    if (credentials->certificate_pem != NULL) {
+        memset(credentials->certificate_pem, 0, credentials->certificate_pem_length);
+        free(credentials->certificate_pem);
+    }
+    if (credentials->private_key_pem != NULL) {
+        memset(credentials->private_key_pem, 0, credentials->private_key_pem_length);
+        free(credentials->private_key_pem);
+    }
+    memset(credentials, 0, sizeof(*credentials));
+}
+
+esp_err_t acme_client_load_stored_tls_credentials(acme_tls_credentials_t *out_credentials)
+{
+    if (out_credentials == NULL) return ESP_ERR_INVALID_ARG;
+    memset(out_credentials, 0, sizeof(*out_credentials));
+
+    acme_certificate_inspection_t inspection;
+    esp_err_t err = acme_client_inspect_stored_certificate(&inspection);
+    if (err != ESP_OK || !inspection.certificate_parse_valid ||
+        !inspection.hostname_matches_certificate || !inspection.private_key_matches_certificate) {
+        return err == ESP_OK ? ESP_ERR_INVALID_STATE : err;
+    }
+
+    err = acme_storage_init();
+    if (err != ESP_OK) return err;
+    nvs_handle_t handle;
+    err = nvs_open_from_partition("nvs_certs", "acme", NVS_READONLY, &handle);
+    if (err != ESP_OK) return err;
+
+    size_t key_len = 0U, pem_len = 0U, host_len = sizeof(out_credentials->hostname);
+    err = nvs_get_blob(handle, ACME_CERT_KEY_NVS_KEY, NULL, &key_len);
+    if (err == ESP_OK) err = nvs_get_blob(handle, ACME_CERT_PEM_NVS_KEY, NULL, &pem_len);
+    if (err != ESP_OK || key_len != ACME_CERT_PRIVATE_KEY_LENGTH || pem_len < 64U || pem_len > ACME_RESPONSE_MAX) {
+        nvs_close(handle); return err == ESP_OK ? ESP_ERR_INVALID_SIZE : err;
+    }
+
+    uint8_t private_key[ACME_CERT_PRIVATE_KEY_LENGTH];
+    size_t read_key_len = sizeof(private_key);
+    char *certificate = calloc(1U, pem_len + 1U);
+    if (certificate == NULL) { nvs_close(handle); return ESP_ERR_NO_MEM; }
+    size_t read_pem_len = pem_len;
+    err = nvs_get_blob(handle, ACME_CERT_KEY_NVS_KEY, private_key, &read_key_len);
+    if (err == ESP_OK) err = nvs_get_blob(handle, ACME_CERT_PEM_NVS_KEY, certificate, &read_pem_len);
+    if (err == ESP_OK) err = nvs_get_str(handle, ACME_CERT_HOST_NVS_KEY, out_credentials->hostname, &host_len);
+    nvs_close(handle);
+    certificate[pem_len] = '\0';
+    if (err != ESP_OK) { memset(private_key,0,sizeof(private_key)); memset(certificate,0,pem_len+1U); free(certificate); return err; }
+
+    char *key_pem = NULL; size_t key_pem_len = 0U;
+    err = pem_encode_ec_private_key(private_key, &key_pem, &key_pem_len);
+    memset(private_key, 0, sizeof(private_key));
+    if (err != ESP_OK) { memset(certificate,0,pem_len+1U); free(certificate); return err; }
+
+    out_credentials->certificate_pem = certificate;
+    out_credentials->certificate_pem_length = pem_len;
+    out_credentials->private_key_pem = key_pem;
+    out_credentials->private_key_pem_length = key_pem_len;
+    return ESP_OK;
+}
+
 static esp_err_t finalize_order_sync(const acme_order_discovery_t *order,
                                      acme_certificate_issue_status_t *out)
 {
