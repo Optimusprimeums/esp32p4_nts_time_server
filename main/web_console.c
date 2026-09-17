@@ -27,7 +27,7 @@ static const char *TAG = "WEB";
 
 #define APP_WEB_CONSOLE_PORT                    443U
 #define APP_WEB_CONSOLE_STACK_SIZE              8192U
-#define APP_WEB_CONSOLE_MAX_HANDLERS            10U
+#define APP_WEB_CONSOLE_MAX_HANDLERS            12U
 #define APP_WEB_CONFIG_BODY_MAX                  1024U
 #define APP_WEB_CONSOLE_MAX_OPEN_SOCKETS        4U
 
@@ -716,6 +716,188 @@ static esp_err_t cloudflare_verify_handler(httpd_req_t *request)
     return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
 }
 
+static bool dns_record_id_is_valid(const char *record_id)
+{
+    if (record_id == NULL || strlen(record_id) != CLOUDFLARE_DNS_RECORD_ID_LENGTH) return false;
+    for (size_t i = 0; i < CLOUDFLARE_DNS_RECORD_ID_LENGTH; ++i) {
+        const char c = record_id[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return false;
+    }
+    return true;
+}
+
+static esp_err_t build_dns01_name(const char *zone_name, char *output, size_t output_size)
+{
+    if (zone_name == NULL || output == NULL) return ESP_ERR_INVALID_ARG;
+    const int n = snprintf(output, output_size, "_acme-challenge.%s", zone_name);
+    return (n < 0 || n >= (int)output_size) ? ESP_ERR_INVALID_SIZE : ESP_OK;
+}
+
+static esp_err_t dns01_create_handler(httpd_req_t *request)
+{
+    char body[APP_WEB_CONFIG_BODY_MAX];
+    if (receive_request_body(request, body, sizeof(body)) != ESP_OK)
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid request body");
+
+    char value[CLOUDFLARE_DNS01_VALUE_MAX_LENGTH + 1U];
+    if (!extract_json_string(body, "value", value, sizeof(value))) {
+        memset(body, 0, sizeof(body));
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "expected DNS-01 value");
+    }
+    memset(body, 0, sizeof(body));
+
+    device_config_cloudflare_credentials_t credentials;
+    esp_err_t err = device_config_get_cloudflare_credentials(&credentials);
+    if (err == ESP_ERR_NOT_FOUND) {
+        memset(value, 0, sizeof(value));
+        httpd_resp_set_status(request, "409 Conflict");
+        return httpd_resp_send(request, "Cloudflare is not configured", HTTPD_RESP_USE_STRLEN);
+    }
+    if (err != ESP_OK) {
+        memset(value, 0, sizeof(value));
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "configuration unavailable");
+    }
+
+    char record_name[APP_CLOUDFLARE_ZONE_NAME_MAX_LENGTH + 32U];
+    if (build_dns01_name(credentials.zone_name, record_name, sizeof(record_name)) != ESP_OK) {
+        memset(credentials.api_token, 0, sizeof(credentials.api_token));
+        memset(value, 0, sizeof(value));
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "DNS-01 name too long");
+    }
+
+    char record_id[CLOUDFLARE_DNS_RECORD_ID_LENGTH + 1U];
+    int http_status = 0;
+    err = cloudflare_client_create_dns01_txt(credentials.api_token, credentials.zone_id,
+                                             record_name, value, record_id,
+                                             sizeof(record_id), &http_status);
+    memset(credentials.api_token, 0, sizeof(credentials.api_token));
+    memset(value, 0, sizeof(value));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "DNS-01 TXT creation failed: err=%s http=%d", esp_err_to_name(err), http_status);
+        httpd_resp_set_status(request, "502 Bad Gateway");
+        return httpd_resp_send(request, "Cloudflare DNS-01 creation failed", HTTPD_RESP_USE_STRLEN);
+    }
+
+    char response[512];
+    const int length = snprintf(response, sizeof(response),
+                                "{\"created\":true,\"record_name\":\"%s\","
+                                "\"record_id\":\"%s\",\"http_status\":%d}\n",
+                                record_name, record_id, http_status);
+    if (length < 0 || length >= (int)sizeof(response))
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "serialization failed");
+    httpd_resp_set_type(request, "application/json");
+    set_security_headers(request);
+    return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t dns01_query_handler(httpd_req_t *request)
+{
+    char body[APP_WEB_CONFIG_BODY_MAX];
+    if (receive_request_body(request, body, sizeof(body)) != ESP_OK)
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid request body");
+
+    char record_id[CLOUDFLARE_DNS_RECORD_ID_LENGTH + 1U];
+    if (!extract_json_string(body, "record_id", record_id, sizeof(record_id)) ||
+        !dns_record_id_is_valid(record_id)) {
+        memset(body, 0, sizeof(body));
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "expected valid record_id");
+    }
+    memset(body, 0, sizeof(body));
+
+    device_config_cloudflare_credentials_t credentials;
+    esp_err_t err = device_config_get_cloudflare_credentials(&credentials);
+    if (err == ESP_ERR_NOT_FOUND) {
+        httpd_resp_set_status(request, "409 Conflict");
+        return httpd_resp_send(request, "Cloudflare is not configured", HTTPD_RESP_USE_STRLEN);
+    }
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "configuration unavailable");
+    }
+
+    char record_name[APP_CLOUDFLARE_ZONE_NAME_MAX_LENGTH + 32U];
+    if (build_dns01_name(credentials.zone_name, record_name, sizeof(record_name)) != ESP_OK) {
+        memset(credentials.api_token, 0, sizeof(credentials.api_token));
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "DNS-01 name too long");
+    }
+
+    int http_status = 0;
+    err = cloudflare_client_verify_dns01_txt(credentials.api_token, credentials.zone_id,
+                                             record_id, record_name, &http_status);
+    memset(credentials.api_token, 0, sizeof(credentials.api_token));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "DNS-01 TXT query failed: err=%s http=%d",
+                 esp_err_to_name(err), http_status);
+        httpd_resp_set_status(request, "404 Not Found");
+        return httpd_resp_send(request, "Expected Cloudflare DNS-01 record not found",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+
+    char response[384];
+    const int length = snprintf(response, sizeof(response),
+                                "{\"verified\":true,\"record_name\":\"%s\"," 
+                                "\"record_id\":\"%s\",\"http_status\":%d}\n",
+                                record_name, record_id, http_status);
+    if (length < 0 || length >= (int)sizeof(response))
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "serialization failed");
+    httpd_resp_set_type(request, "application/json");
+    set_security_headers(request);
+    return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t dns01_delete_handler(httpd_req_t *request)
+{
+    char body[APP_WEB_CONFIG_BODY_MAX];
+    if (receive_request_body(request, body, sizeof(body)) != ESP_OK)
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid request body");
+
+    char record_id[CLOUDFLARE_DNS_RECORD_ID_LENGTH + 1U];
+    if (!extract_json_string(body, "record_id", record_id, sizeof(record_id)) ||
+        !dns_record_id_is_valid(record_id)) {
+        memset(body, 0, sizeof(body));
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "expected valid record_id");
+    }
+    memset(body, 0, sizeof(body));
+
+    device_config_cloudflare_credentials_t credentials;
+    esp_err_t err = device_config_get_cloudflare_credentials(&credentials);
+    if (err == ESP_ERR_NOT_FOUND) {
+        httpd_resp_set_status(request, "409 Conflict");
+        return httpd_resp_send(request, "Cloudflare is not configured", HTTPD_RESP_USE_STRLEN);
+    }
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "configuration unavailable");
+    }
+
+    char record_name[APP_CLOUDFLARE_ZONE_NAME_MAX_LENGTH + 32U];
+    if (build_dns01_name(credentials.zone_name, record_name, sizeof(record_name)) != ESP_OK) {
+        memset(credentials.api_token, 0, sizeof(credentials.api_token));
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "DNS-01 name too long");
+    }
+
+    int http_status = 0;
+    err = cloudflare_client_delete_dns01_txt(credentials.api_token, credentials.zone_id,
+                                             record_id, record_name, &http_status);
+    memset(credentials.api_token, 0, sizeof(credentials.api_token));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "DNS-01 TXT deletion failed/refused: err=%s http=%d", esp_err_to_name(err), http_status);
+        httpd_resp_set_status(request, "502 Bad Gateway");
+        return httpd_resp_send(request, "Cloudflare DNS-01 deletion failed", HTTPD_RESP_USE_STRLEN);
+    }
+
+    char response[256];
+    const int length = snprintf(response, sizeof(response),
+                                "{\"deleted\":true,\"record_id\":\"%s\",\"http_status\":%d}\n",
+                                record_id, http_status);
+    if (length < 0 || length >= (int)sizeof(response))
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "serialization failed");
+    httpd_resp_set_type(request, "application/json");
+    set_security_headers(request);
+    return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t index_handler(httpd_req_t *request)
 {
     static const char html[] =
@@ -937,6 +1119,21 @@ static const httpd_uri_t s_cloudflare_verify_uri = {
     .handler = cloudflare_verify_handler, .user_ctx = NULL,
 };
 
+static const httpd_uri_t s_dns01_create_uri = {
+    .uri = "/api/v1/cloudflare/dns01", .method = HTTP_POST,
+    .handler = dns01_create_handler, .user_ctx = NULL,
+};
+
+static const httpd_uri_t s_dns01_query_uri = {
+    .uri = "/api/v1/cloudflare/dns01/query", .method = HTTP_POST,
+    .handler = dns01_query_handler, .user_ctx = NULL,
+};
+
+static const httpd_uri_t s_dns01_delete_uri = {
+    .uri = "/api/v1/cloudflare/dns01", .method = HTTP_DELETE,
+    .handler = dns01_delete_handler, .user_ctx = NULL,
+};
+
 esp_err_t web_console_start(void)
 {
     if (s_started) {
@@ -1017,6 +1214,12 @@ esp_err_t web_console_start(void)
     err = httpd_register_uri_handler(s_server, &s_cloudflare_delete_uri);
     if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
     err = httpd_register_uri_handler(s_server, &s_cloudflare_verify_uri);
+    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
+    err = httpd_register_uri_handler(s_server, &s_dns01_create_uri);
+    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
+    err = httpd_register_uri_handler(s_server, &s_dns01_query_uri);
+    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
+    err = httpd_register_uri_handler(s_server, &s_dns01_delete_uri);
     if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
 
     s_started = true;
