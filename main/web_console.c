@@ -31,7 +31,7 @@ static const char *TAG = "WEB";
 
 #define APP_WEB_CONSOLE_PORT                    443U
 #define APP_WEB_CONSOLE_STACK_SIZE              8192U
-#define APP_WEB_CONSOLE_MAX_HANDLERS            24U
+#define APP_WEB_CONSOLE_MAX_HANDLERS            30U
 #define APP_WEB_CONFIG_BODY_MAX                  1024U
 #define APP_WEB_CONSOLE_MAX_OPEN_SOCKETS        4U
 
@@ -136,6 +136,28 @@ static bool get_current_unix_time(int64_t *out_unix_time)
         (int64_t)ntp_time.seconds -
         (int64_t)APP_NTP_EPOCH_DELTA;
 
+    return true;
+}
+
+static bool parse_utc_timestamp(const char *text, int64_t *out_unix)
+{
+    if (text == NULL || out_unix == NULL) return false;
+    int y, mo, d, h, mi, sec;
+    char tail = '\0';
+    if (sscanf(text, "%4d-%2d-%2dT%2d:%2d:%2dZ%c", &y, &mo, &d, &h, &mi, &sec, &tail) != 6)
+        return false;
+    if (y < 1970 || mo < 1 || mo > 12 || d < 1 || d > 31 || h < 0 || h > 23 ||
+        mi < 0 || mi > 59 || sec < 0 || sec > 60) return false;
+
+    /* Howard Hinnant's civil-date transform, adapted to integer UTC seconds. */
+    y -= mo <= 2;
+    const int era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned mp = (unsigned)(mo + (mo > 2 ? -3 : 9));
+    const unsigned doy = (153U * mp + 2U) / 5U + (unsigned)d - 1U;
+    const unsigned doe = yoe * 365U + yoe / 4U - yoe / 100U + doy;
+    const int64_t days = (int64_t)era * 146097LL + (int64_t)doe - 719468LL;
+    *out_unix = days * 86400LL + (int64_t)h * 3600LL + (int64_t)mi * 60LL + sec;
     return true;
 }
 
@@ -1340,18 +1362,8 @@ static esp_err_t acme_staging_certificate_issue_handler(httpd_req_t *request)
 }
 
 
-static esp_err_t acme_production_certificate_issue_handler(httpd_req_t *request)
+static esp_err_t production_certificate_issue_for_hostname(httpd_req_t *request, const char *hostname)
 {
-    char body[APP_WEB_CONFIG_BODY_MAX];
-    if (receive_request_body(request, body, sizeof(body)) != ESP_OK)
-        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid request body");
-    char hostname[ACME_DNS_NAME_MAX_LENGTH + 1U];
-    if (!extract_json_string(body, "hostname", hostname, sizeof(hostname))) {
-        memset(body,0,sizeof(body));
-        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "expected hostname");
-    }
-    memset(body,0,sizeof(body));
-
     device_config_snapshot_t config;
     esp_err_t err = device_config_get_snapshot(&config);
     if (err != ESP_OK) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "configuration unavailable");
@@ -1447,6 +1459,78 @@ static esp_err_t acme_production_certificate_issue_handler(httpd_req_t *request)
     if (certificate_err != ESP_OK || !certificate.stored) httpd_resp_set_status(request,"502 Bad Gateway");
     const esp_err_t send_err=httpd_resp_send(request,response,HTTPD_RESP_USE_STRLEN);
     memset(response,0,4096U); free(response); return send_err;
+
+}
+
+static esp_err_t acme_production_certificate_issue_handler(httpd_req_t *request)
+{
+    char body[APP_WEB_CONFIG_BODY_MAX];
+    if (receive_request_body(request, body, sizeof(body)) != ESP_OK)
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid request body");
+    char hostname[ACME_DNS_NAME_MAX_LENGTH + 1U];
+    if (!extract_json_string(body, "hostname", hostname, sizeof(hostname))) {
+        memset(body,0,sizeof(body));
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "expected hostname");
+    }
+    memset(body,0,sizeof(body));
+
+    acme_certificate_inspection_t existing;
+    const esp_err_t inspect_err = acme_client_inspect_stored_production_certificate(&existing);
+    if (inspect_err == ESP_OK && existing.certificate_parse_valid &&
+        existing.hostname_matches_certificate && existing.private_key_matches_certificate) {
+        httpd_resp_set_status(request, "409 Conflict");
+        return httpd_resp_send(request,
+            "Production certificate already exists; use the controlled renewal endpoint",
+            HTTPD_RESP_USE_STRLEN);
+    }
+    if (inspect_err != ESP_OK && inspect_err != ESP_ERR_NOT_FOUND)
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "Production certificate inspection failed");
+
+    return production_certificate_issue_for_hostname(request, hostname);
+}
+
+static esp_err_t acme_production_certificate_renew_handler(httpd_req_t *request)
+{
+    acme_certificate_inspection_t status;
+    const esp_err_t inspect_err = acme_client_inspect_stored_production_certificate(&status);
+    if (inspect_err == ESP_ERR_NOT_FOUND) {
+        httpd_resp_set_status(request, "409 Conflict");
+        return httpd_resp_send(request, "No production certificate exists; use initial issuance",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+    if (inspect_err != ESP_OK || !status.certificate_parse_valid ||
+        !status.hostname_matches_certificate || !status.private_key_matches_certificate)
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "Stored production certificate is not valid for renewal");
+
+    int64_t now = 0, expires = 0;
+    if (!get_current_unix_time(&now) || !parse_utc_timestamp(status.valid_to, &expires)) {
+        httpd_resp_set_status(request, "409 Conflict");
+        return httpd_resp_send(request, "Disciplined time unavailable; renewal decision refused",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+
+    const int64_t seconds_remaining = expires - now;
+    if (seconds_remaining > 30LL * 86400LL) {
+        char response[256];
+        const int64_t days_remaining = seconds_remaining / 86400LL;
+        const int length = snprintf(response, sizeof(response),
+            "{\"renewed\":false,\"reason\":\"not_due\",\"days_remaining\":%" PRId64 ","
+            "\"renew_before_days\":30,\"automatic_renewal\":false}\n", days_remaining);
+        if (length < 0 || length >= (int)sizeof(response))
+            return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "serialization failed");
+        httpd_resp_set_status(request, "409 Conflict");
+        httpd_resp_set_type(request, "application/json");
+        set_security_headers(request);
+        return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+    }
+
+    /* Renewal is deliberately manual and reuses the existing production issuance path.
+     * That path creates a fresh P-256 certificate key and only stores material after
+     * the returned certificate has passed SAN/private-key validation. It does not
+     * activate the new certificate for management TLS. */
+    return production_certificate_issue_for_hostname(request, status.hostname);
 }
 
 
@@ -1512,14 +1596,26 @@ static esp_err_t acme_production_certificate_inspection_handler(httpd_req_t *req
         return httpd_resp_send(request, "Stored production certificate inspection failed", HTTPD_RESP_USE_STRLEN);
     }
 
-    char response[1024];
+    char active_slot = '?';
+    bool slot_a_valid = false, slot_b_valid = false, legacy_material_present = false;
+    const esp_err_t storage_err = acme_client_get_production_storage_status(
+        &active_slot, &slot_a_valid, &slot_b_valid, &legacy_material_present);
+    if (storage_err != ESP_OK) {
+        ESP_LOGE(TAG, "Production dual-slot status failed: %s", esp_err_to_name(storage_err));
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "Production dual-slot status failed");
+    }
+
+    char response[1280];
     const int length = snprintf(response, sizeof(response),
         "{\"stored\":true,\"environment\":\"production\",\"hostname\":\"%s\","
         "\"key_present\":%s,\"certificate_present\":%s,\"hostname_present\":%s,"
         "\"certificate_parse_valid\":%s,\"hostname_matches_certificate\":%s,"
         "\"private_key_matches_certificate\":%s,\"chain_certificate_count\":%u,"
         "\"pem_length\":%u,\"valid_from\":\"%s\",\"valid_to\":\"%s\","
-        "\"leaf_sha256\":\"%s\",\"active_management_tls_changed\":%s,"
+        "\"leaf_sha256\":\"%s\",\"production_storage\":{\"mode\":\"dual_slot\","
+        "\"active_slot\":\"%c\",\"slot_a_valid\":%s,\"slot_b_valid\":%s,"
+        "\"legacy_material_present\":%s},\"active_management_tls_changed\":%s,"
         "\"active_tls_source\":\"%s\"}\n",
         status.hostname,
         status.key_present ? "true" : "false",
@@ -1531,6 +1627,10 @@ static esp_err_t acme_production_certificate_inspection_handler(httpd_req_t *req
         status.chain_certificate_count,
         (unsigned)status.certificate_pem_length,
         status.valid_from, status.valid_to, status.leaf_sha256,
+        active_slot,
+        slot_a_valid ? "true" : "false",
+        slot_b_valid ? "true" : "false",
+        legacy_material_present ? "true" : "false",
         s_tls_source != WEB_TLS_EMBEDDED ? "true" : "false",
         tls_source_name(s_tls_source));
     if (length < 0 || length >= (int)sizeof(response))
@@ -1541,6 +1641,91 @@ static esp_err_t acme_production_certificate_inspection_handler(httpd_req_t *req
     return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
 }
 
+
+static esp_err_t acme_production_certificate_lifecycle_handler(httpd_req_t *request)
+{
+    acme_certificate_inspection_t status;
+    const esp_err_t err = acme_client_inspect_stored_production_certificate(&status);
+    if (err == ESP_ERR_NOT_FOUND) {
+        httpd_resp_set_status(request, "404 Not Found");
+        httpd_resp_set_type(request, "application/json");
+        set_security_headers(request);
+        return httpd_resp_send(request,
+            "{\"stored\":false,\"environment\":\"production\",\"renewal_policy\":{\"mode\":\"manual\",\"renew_before_days\":30,\"urgent_before_days\":7,\"automatic_renewal\":false}}\n",
+            HTTPD_RESP_USE_STRLEN);
+    }
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Production certificate inspection failed");
+
+    int64_t now = 0, expires = 0;
+    const bool now_valid = get_current_unix_time(&now);
+    const bool expiry_valid = parse_utc_timestamp(status.valid_to, &expires);
+    int64_t seconds_remaining = 0;
+    int64_t days_remaining = 0;
+    const char *state = "time_unavailable";
+    bool renewal_due = false;
+    bool urgent = false;
+    bool expired = false;
+
+    if (now_valid && expiry_valid) {
+        seconds_remaining = expires - now;
+        days_remaining = seconds_remaining >= 0 ? seconds_remaining / 86400LL : -((-seconds_remaining + 86399LL) / 86400LL);
+        expired = seconds_remaining <= 0;
+        urgent = !expired && seconds_remaining <= 7LL * 86400LL;
+        renewal_due = !expired && seconds_remaining <= 30LL * 86400LL;
+        state = expired ? "expired" : (urgent ? "urgent" : (renewal_due ? "renewal_due" : "valid"));
+    }
+
+    char response[1400];
+    const int length = snprintf(response, sizeof(response),
+        "{\"stored\":true,\"environment\":\"production\",\"hostname\":\"%s\"," 
+        "\"certificate_valid\":%s,\"valid_from\":\"%s\",\"valid_to\":\"%s\"," 
+        "\"clock_now_valid\":%s,\"unix_time\":%" PRId64 ",\"expiry_unix_time\":%" PRId64 ","
+        "\"seconds_remaining\":%" PRId64 ",\"days_remaining\":%" PRId64 ","
+        "\"lifecycle_state\":\"%s\",\"renewal_due\":%s,\"urgent\":%s,\"expired\":%s,"
+        "\"renewal_policy\":{\"mode\":\"manual\",\"renew_before_days\":30,\"urgent_before_days\":7,"
+        "\"automatic_renewal\":false,\"private_key_exportable\":false,\"acme_account_key_exportable\":false},"
+        "\"active_tls_source\":\"%s\"}\n",
+        status.hostname,
+        (status.certificate_parse_valid && status.hostname_matches_certificate && status.private_key_matches_certificate) ? "true" : "false",
+        status.valid_from, status.valid_to,
+        now_valid ? "true" : "false", now_valid ? now : 0,
+        expiry_valid ? expires : 0, seconds_remaining, days_remaining, state,
+        renewal_due ? "true" : "false", urgent ? "true" : "false", expired ? "true" : "false",
+        tls_source_name(s_tls_source));
+    if (length < 0 || length >= (int)sizeof(response))
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "serialization failed");
+    httpd_resp_set_type(request, "application/json");
+    set_security_headers(request);
+    return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t acme_production_certificate_export_handler(httpd_req_t *request)
+{
+    char *pem = NULL;
+    size_t pem_length = 0U;
+    char hostname[ACME_DNS_NAME_MAX_LENGTH + 1U];
+    const esp_err_t err = acme_client_load_production_certificate_pem(&pem, &pem_length,
+                                                                      hostname, sizeof(hostname));
+    if (err == ESP_ERR_NOT_FOUND) {
+        return httpd_resp_send_err(request, HTTPD_404_NOT_FOUND, "Production certificate not stored");
+    }
+    if (err != ESP_OK || pem == NULL) {
+        ESP_LOGE(TAG, "Production certificate export failed: %s", esp_err_to_name(err));
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Production certificate export failed");
+    }
+
+    httpd_resp_set_type(request, "application/x-pem-file");
+    httpd_resp_set_hdr(request, "Content-Disposition", "attachment; filename=production-chain.pem");
+    httpd_resp_set_hdr(request, "X-Private-Key-Exportable", "false");
+    httpd_resp_set_hdr(request, "X-ACME-Account-Key-Exportable", "false");
+    httpd_resp_set_hdr(request, "X-Certificate-Private-Key-Policy", "non-exportable");
+    set_security_headers(request);
+    const esp_err_t send_err = httpd_resp_send(request, pem, (ssize_t)pem_length);
+    memset(pem, 0, pem_length + 1U);
+    free(pem);
+    return send_err;
+}
 
 static esp_err_t acme_certificate_activate_test_handler(httpd_req_t *request)
 {
@@ -1919,6 +2104,13 @@ static const httpd_uri_t s_acme_production_certificate_issue_uri = {
     .user_ctx = NULL,
 };
 
+static const httpd_uri_t s_acme_production_certificate_renew_uri = {
+    .uri = "/api/v1/acme/production/certificate/renew",
+    .method = HTTP_POST,
+    .handler = acme_production_certificate_renew_handler,
+    .user_ctx = NULL,
+};
+
 
 static const httpd_uri_t s_acme_certificate_inspection_uri = {
     .uri = "/api/v1/acme/certificate",
@@ -1931,6 +2123,20 @@ static const httpd_uri_t s_acme_production_certificate_inspection_uri = {
     .uri = "/api/v1/acme/production/certificate",
     .method = HTTP_GET,
     .handler = acme_production_certificate_inspection_handler,
+    .user_ctx = NULL,
+};
+
+static const httpd_uri_t s_acme_production_certificate_lifecycle_uri = {
+    .uri = "/api/v1/acme/production/certificate/lifecycle",
+    .method = HTTP_GET,
+    .handler = acme_production_certificate_lifecycle_handler,
+    .user_ctx = NULL,
+};
+
+static const httpd_uri_t s_acme_production_certificate_export_uri = {
+    .uri = "/api/v1/acme/production/certificate/export",
+    .method = HTTP_GET,
+    .handler = acme_production_certificate_export_handler,
     .user_ctx = NULL,
 };
 
@@ -1964,8 +2170,11 @@ static esp_err_t register_all_handlers(httpd_handle_t server)
         &s_acme_staging_probe_uri, &s_acme_account_status_uri,
         &s_acme_account_provision_uri, &s_acme_staging_order_discover_uri,
         &s_acme_staging_dns01_validate_uri, &s_acme_staging_certificate_issue_uri,
-        &s_acme_production_certificate_issue_uri, &s_acme_certificate_inspection_uri,
-        &s_acme_production_certificate_inspection_uri, &s_acme_certificate_activate_test_uri,
+        &s_acme_production_certificate_issue_uri, &s_acme_production_certificate_renew_uri,
+        &s_acme_certificate_inspection_uri,
+        &s_acme_production_certificate_inspection_uri, &s_acme_production_certificate_lifecycle_uri,
+        &s_acme_production_certificate_export_uri,
+        &s_acme_certificate_activate_test_uri,
         &s_acme_production_certificate_activate_uri, &s_acme_certificate_rollback_uri,
     };
     for (size_t i = 0U; i < sizeof(handlers) / sizeof(handlers[0]); ++i) {
@@ -2072,8 +2281,16 @@ static void tls_transition_task(void *arg)
 esp_err_t web_console_start(void)
 {
     if (s_started) return ESP_OK;
+    esp_err_t err = acme_client_prepare_production_storage();
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+        ESP_LOGE(TAG, "Production credential store preparation failed: %s; using embedded credential",
+                 esp_err_to_name(err));
+        (void)acme_client_set_production_boot_selected(false);
+        return start_https_server(WEB_TLS_EMBEDDED);
+    }
+
     bool production_selected = false;
-    esp_err_t err = acme_client_get_production_boot_selected(&production_selected);
+    err = acme_client_get_production_boot_selected(&production_selected);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "TLS boot selection read failed: %s; using embedded credential", esp_err_to_name(err));
         (void)acme_client_set_production_boot_selected(false);

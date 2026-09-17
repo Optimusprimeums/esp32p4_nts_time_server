@@ -126,6 +126,10 @@ esp_err_t acme_client_inspect_stored_certificate(acme_certificate_inspection_t *
 /* Read-only inspection of separately stored production certificate material. */
 esp_err_t acme_client_inspect_stored_production_certificate(acme_certificate_inspection_t *out_status);
 
+/* Load only public production certificate PEM for authenticated export. Caller frees *out_pem. */
+esp_err_t acme_client_load_production_certificate_pem(char **out_pem, size_t *out_pem_length,
+                                                       char *out_hostname, size_t hostname_size);
+
 /* Load validated stored TLS material for in-process server use. Never expose via HTTP. */
 esp_err_t acme_client_load_stored_tls_credentials(acme_tls_credentials_t *out_credentials);
 esp_err_t acme_client_load_production_tls_credentials(acme_tls_credentials_t *out_credentials);
@@ -134,6 +138,14 @@ void acme_client_free_tls_credentials(acme_tls_credentials_t *credentials);
 /* Persisted boot TLS selection. Only production may be selected persistently. */
 esp_err_t acme_client_get_production_boot_selected(bool *out_selected);
 esp_err_t acme_client_set_production_boot_selected(bool selected);
+/* Prepare/migrate the production credential store. ESP_ERR_NOT_FOUND means no production credential exists. */
+esp_err_t acme_client_prepare_production_storage(void);
+
+/* Dual-slot production credential storage diagnostics. active_slot is 'A' or 'B'. */
+esp_err_t acme_client_get_production_storage_status(char *active_slot,
+                                                     bool *slot_a_valid,
+                                                     bool *slot_b_valid,
+                                                     bool *legacy_material_present);
 
 /* Phase 5B.8h production ACME APIs. Production account KID and certificate
  * material are stored separately from staging state. These APIs never activate

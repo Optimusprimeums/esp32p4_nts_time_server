@@ -1228,7 +1228,14 @@ cleanup:
 #define ACME_CERT_HOST_NVS_KEY "cert_host"
 #define ACME_PROD_CERT_KEY_NVS_KEY "pcert_key"
 #define ACME_PROD_CERT_PEM_NVS_KEY "pcert_pem"
-#define ACME_PROD_CERT_HOST_NVS_KEY "pcert_host"
+#define ACME_PROD_CERT_HOST_NVS_KEY "pcert_host" /* legacy single-slot */
+#define ACME_PROD_SLOT_A_KEY_NVS_KEY "pkey_a"
+#define ACME_PROD_SLOT_A_PEM_NVS_KEY "ppem_a"
+#define ACME_PROD_SLOT_A_HOST_NVS_KEY "phost_a"
+#define ACME_PROD_SLOT_B_KEY_NVS_KEY "pkey_b"
+#define ACME_PROD_SLOT_B_PEM_NVS_KEY "ppem_b"
+#define ACME_PROD_SLOT_B_HOST_NVS_KEY "phost_b"
+#define ACME_PROD_ACTIVE_SLOT_NVS_KEY "pslot"
 #define ACME_TLS_BOOT_NVS_KEY "tls_prod"
 #define ACME_CERT_PRIVATE_KEY_LENGTH 32U
 #define ACME_CSR_MAX 1024U
@@ -1400,26 +1407,7 @@ static esp_err_t validate_certificate_material(const char *hostname, const uint8
 
 static esp_err_t store_certificate_material(bool production, const char *hostname,
                                             const uint8_t private_key[32],
-                                            const char *pem, size_t pem_len)
-{
-    if (!dns_name_is_valid(hostname) || private_key == NULL || pem == NULL || pem_len == 0U) return ESP_ERR_INVALID_ARG;
-    esp_err_t err = validate_certificate_material(hostname, private_key, pem, pem_len);
-    if (err != ESP_OK) return err;
-    err = acme_storage_init();
-    if (err != ESP_OK) return err;
-    nvs_handle_t handle;
-    err = nvs_open_from_partition("nvs_certs", "acme", NVS_READWRITE, &handle);
-    if (err != ESP_OK) return err;
-    const char *key_name = production ? ACME_PROD_CERT_KEY_NVS_KEY : ACME_CERT_KEY_NVS_KEY;
-    const char *pem_name = production ? ACME_PROD_CERT_PEM_NVS_KEY : ACME_CERT_PEM_NVS_KEY;
-    const char *host_name = production ? ACME_PROD_CERT_HOST_NVS_KEY : ACME_CERT_HOST_NVS_KEY;
-    err = nvs_set_blob(handle, key_name, private_key, 32U);
-    if (err == ESP_OK) err = nvs_set_blob(handle, pem_name, pem, pem_len + 1U);
-    if (err == ESP_OK) err = nvs_set_str(handle, host_name, hostname);
-    if (err == ESP_OK) err = nvs_commit(handle);
-    nvs_close(handle);
-    return err;
-}
+                                            const char *pem, size_t pem_len);
 
 
 
@@ -1464,6 +1452,285 @@ static esp_err_t validate_certificate_material(const char *hostname, const uint8
                        bytes_contain(chain.raw.p, chain.raw.len, public_key, sizeof(public_key));
     memset(public_key,0,sizeof(public_key)); mbedtls_x509_crt_free(&chain);
     return match ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+}
+
+typedef struct {
+    const char *key;
+    const char *pem;
+    const char *host;
+} production_slot_names_t;
+
+static const production_slot_names_t s_prod_slots[2] = {
+    { ACME_PROD_SLOT_A_KEY_NVS_KEY, ACME_PROD_SLOT_A_PEM_NVS_KEY, ACME_PROD_SLOT_A_HOST_NVS_KEY },
+    { ACME_PROD_SLOT_B_KEY_NVS_KEY, ACME_PROD_SLOT_B_PEM_NVS_KEY, ACME_PROD_SLOT_B_HOST_NVS_KEY },
+};
+
+static esp_err_t load_material_by_names(const production_slot_names_t *names,
+                                        uint8_t private_key[ACME_CERT_PRIVATE_KEY_LENGTH],
+                                        char **out_pem, size_t *out_pem_len,
+                                        char *hostname, size_t hostname_size)
+{
+    if (names == NULL || private_key == NULL || out_pem == NULL || out_pem_len == NULL ||
+        hostname == NULL || hostname_size < 2U) return ESP_ERR_INVALID_ARG;
+    *out_pem = NULL; *out_pem_len = 0U; hostname[0] = '\0';
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open_from_partition("nvs_certs", "acme", NVS_READONLY, &handle);
+    if (err != ESP_OK) return err;
+    size_t key_len = 0U, pem_len = 0U, host_len = 0U;
+    esp_err_t ke = nvs_get_blob(handle, names->key, NULL, &key_len);
+    esp_err_t pe = nvs_get_blob(handle, names->pem, NULL, &pem_len);
+    esp_err_t he = nvs_get_str(handle, names->host, NULL, &host_len);
+    if (ke == ESP_ERR_NVS_NOT_FOUND || pe == ESP_ERR_NVS_NOT_FOUND || he == ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(handle); return ESP_ERR_NOT_FOUND;
+    }
+    if (ke != ESP_OK || pe != ESP_OK || he != ESP_OK ||
+        key_len != ACME_CERT_PRIVATE_KEY_LENGTH || pem_len < 64U || pem_len > ACME_RESPONSE_MAX ||
+        host_len < 2U || host_len > hostname_size) {
+        nvs_close(handle); return ESP_ERR_INVALID_SIZE;
+    }
+    char *pem = calloc(1U, pem_len + 1U);
+    if (pem == NULL) { nvs_close(handle); return ESP_ERR_NO_MEM; }
+    size_t rk = ACME_CERT_PRIVATE_KEY_LENGTH, rp = pem_len, rh = hostname_size;
+    err = nvs_get_blob(handle, names->key, private_key, &rk);
+    if (err == ESP_OK) err = nvs_get_blob(handle, names->pem, pem, &rp);
+    if (err == ESP_OK) err = nvs_get_str(handle, names->host, hostname, &rh);
+    nvs_close(handle);
+    if (err != ESP_OK) { memset(pem,0,pem_len+1U); free(pem); return err; }
+    pem[pem_len] = '\0';
+    *out_pem = pem; *out_pem_len = pem_len;
+    return ESP_OK;
+}
+
+static esp_err_t validate_production_slot(unsigned slot)
+{
+    if (slot > 1U) return ESP_ERR_INVALID_ARG;
+    uint8_t key[ACME_CERT_PRIVATE_KEY_LENGTH] = {0};
+    char *pem = NULL; size_t pem_len = 0U;
+    char host[ACME_DNS_NAME_MAX_LENGTH + 1U];
+    esp_err_t err = load_material_by_names(&s_prod_slots[slot], key, &pem, &pem_len, host, sizeof(host));
+    if (err == ESP_OK) {
+        size_t semantic_len = (pem_len > 0U && pem[pem_len - 1U] == '\0') ? pem_len - 1U : pem_len;
+        err = validate_certificate_material(host, key, pem, semantic_len);
+    }
+    memset(key,0,sizeof(key));
+    if (pem != NULL) { memset(pem,0,pem_len+1U); free(pem); }
+    return err;
+}
+
+static esp_err_t read_production_slot_selector(uint8_t *out_slot, bool *out_present)
+{
+    if (out_slot == NULL || out_present == NULL) return ESP_ERR_INVALID_ARG;
+    *out_slot = 0U; *out_present = false;
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open_from_partition("nvs_certs", "acme", NVS_READONLY, &handle);
+    if (err != ESP_OK) return err;
+    uint8_t slot = 0U;
+    err = nvs_get_u8(handle, ACME_PROD_ACTIVE_SLOT_NVS_KEY, &slot);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    if (err != ESP_OK) return err;
+    if (slot > 1U) return ESP_ERR_INVALID_STATE;
+    *out_slot = slot; *out_present = true; return ESP_OK;
+}
+
+static esp_err_t commit_production_slot_selector(uint8_t slot)
+{
+    if (slot > 1U) return ESP_ERR_INVALID_ARG;
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open_from_partition("nvs_certs", "acme", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(handle, ACME_PROD_ACTIVE_SLOT_NVS_KEY, slot);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return err;
+}
+
+static esp_err_t migrate_legacy_production_material(void)
+{
+    uint8_t selector = 0U; bool present = false;
+    esp_err_t err = read_production_slot_selector(&selector, &present);
+    if (err != ESP_OK || present) return err;
+
+    const production_slot_names_t legacy = {
+        ACME_PROD_CERT_KEY_NVS_KEY, ACME_PROD_CERT_PEM_NVS_KEY, ACME_PROD_CERT_HOST_NVS_KEY
+    };
+    uint8_t key[ACME_CERT_PRIVATE_KEY_LENGTH] = {0};
+    char *pem = NULL; size_t pem_len = 0U;
+    char host[ACME_DNS_NAME_MAX_LENGTH + 1U];
+    err = load_material_by_names(&legacy, key, &pem, &pem_len, host, sizeof(host));
+    if (err != ESP_OK) {
+        memset(key,0,sizeof(key));
+        if (pem != NULL) { memset(pem,0,pem_len+1U); free(pem); }
+        return err;
+    }
+    size_t semantic_len = (pem_len > 0U && pem[pem_len - 1U] == '\0') ? pem_len - 1U : pem_len;
+    err = validate_certificate_material(host, key, pem, semantic_len);
+    if (err == ESP_OK) {
+        nvs_handle_t handle;
+        err = nvs_open_from_partition("nvs_certs", "acme", NVS_READWRITE, &handle);
+        if (err == ESP_OK) {
+            err = nvs_set_blob(handle, s_prod_slots[0].key, key, sizeof(key));
+            if (err == ESP_OK) err = nvs_set_blob(handle, s_prod_slots[0].pem, pem, pem_len);
+            if (err == ESP_OK) err = nvs_set_str(handle, s_prod_slots[0].host, host);
+            if (err == ESP_OK) err = nvs_commit(handle);
+            nvs_close(handle);
+        }
+    }
+    memset(key,0,sizeof(key));
+    if (pem != NULL) { memset(pem,0,pem_len+1U); free(pem); }
+    if (err == ESP_OK) err = validate_production_slot(0U);
+    if (err == ESP_OK) err = commit_production_slot_selector(0U);
+    if (err == ESP_OK) ESP_LOGI(TAG, "Migrated legacy production certificate to dual-slot A");
+    return err;
+}
+
+static esp_err_t retire_legacy_production_material_if_safe(void)
+{
+    /* Legacy retirement is intentionally conservative. Both dual slots must
+     * independently validate, and the effective active credential must match
+     * the legacy credential byte-for-byte (key/hostname and stored PEM blob)
+     * before any legacy key is erased. */
+    if (validate_production_slot(0U) != ESP_OK || validate_production_slot(1U) != ESP_OK) {
+        return ESP_OK;
+    }
+
+    uint8_t selected = 0U;
+    bool selector_present = false;
+    esp_err_t err = read_production_slot_selector(&selected, &selector_present);
+    if (err != ESP_OK || !selector_present) return err;
+
+    uint8_t effective = selected;
+    if (validate_production_slot(effective) != ESP_OK) {
+        effective ^= 1U;
+        if (validate_production_slot(effective) != ESP_OK) return ESP_OK;
+    }
+
+    const production_slot_names_t legacy = {
+        ACME_PROD_CERT_KEY_NVS_KEY, ACME_PROD_CERT_PEM_NVS_KEY, ACME_PROD_CERT_HOST_NVS_KEY
+    };
+    uint8_t legacy_key[ACME_CERT_PRIVATE_KEY_LENGTH] = {0};
+    uint8_t active_key[ACME_CERT_PRIVATE_KEY_LENGTH] = {0};
+    char *legacy_pem = NULL, *active_pem = NULL;
+    size_t legacy_pem_len = 0U, active_pem_len = 0U;
+    char legacy_host[ACME_DNS_NAME_MAX_LENGTH + 1U];
+    char active_host[ACME_DNS_NAME_MAX_LENGTH + 1U];
+
+    err = load_material_by_names(&legacy, legacy_key, &legacy_pem, &legacy_pem_len,
+                                 legacy_host, sizeof(legacy_host));
+    if (err == ESP_ERR_NVS_NOT_FOUND || err == ESP_ERR_NOT_FOUND) {
+        err = ESP_OK;
+        goto cleanup;
+    }
+    if (err != ESP_OK) goto cleanup;
+
+    size_t legacy_semantic_len = (legacy_pem_len > 0U && legacy_pem[legacy_pem_len - 1U] == '\0')
+                                 ? legacy_pem_len - 1U : legacy_pem_len;
+    err = validate_certificate_material(legacy_host, legacy_key, legacy_pem, legacy_semantic_len);
+    if (err != ESP_OK) goto cleanup;
+
+    err = load_material_by_names(&s_prod_slots[effective], active_key, &active_pem, &active_pem_len,
+                                 active_host, sizeof(active_host));
+    if (err != ESP_OK) goto cleanup;
+
+    if (strcmp(legacy_host, active_host) != 0 ||
+        memcmp(legacy_key, active_key, sizeof(legacy_key)) != 0 ||
+        legacy_pem_len != active_pem_len ||
+        memcmp(legacy_pem, active_pem, legacy_pem_len) != 0) {
+        ESP_LOGW(TAG, "Legacy production credential differs from active dual-slot credential; retaining legacy material");
+        err = ESP_OK;
+        goto cleanup;
+    }
+
+    nvs_handle_t handle;
+    err = nvs_open_from_partition("nvs_certs", "acme", NVS_READWRITE, &handle);
+    if (err != ESP_OK) goto cleanup;
+    esp_err_t erase_err = nvs_erase_key(handle, ACME_PROD_CERT_KEY_NVS_KEY);
+    if (erase_err == ESP_OK || erase_err == ESP_ERR_NVS_NOT_FOUND) {
+        erase_err = nvs_erase_key(handle, ACME_PROD_CERT_PEM_NVS_KEY);
+    }
+    if (erase_err == ESP_OK || erase_err == ESP_ERR_NVS_NOT_FOUND) {
+        erase_err = nvs_erase_key(handle, ACME_PROD_CERT_HOST_NVS_KEY);
+    }
+    if (erase_err == ESP_OK || erase_err == ESP_ERR_NVS_NOT_FOUND) erase_err = nvs_commit(handle);
+    nvs_close(handle);
+    err = erase_err;
+    if (err == ESP_OK) ESP_LOGI(TAG, "Retired validated legacy production certificate material");
+
+cleanup:
+    memset(legacy_key, 0, sizeof(legacy_key));
+    memset(active_key, 0, sizeof(active_key));
+    if (legacy_pem != NULL) { memset(legacy_pem, 0, legacy_pem_len + 1U); free(legacy_pem); }
+    if (active_pem != NULL) { memset(active_pem, 0, active_pem_len + 1U); free(active_pem); }
+    return err;
+}
+
+static esp_err_t resolve_production_slot(uint8_t *out_slot)
+{
+    if (out_slot == NULL) return ESP_ERR_INVALID_ARG;
+    esp_err_t err = migrate_legacy_production_material();
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) return err;
+    uint8_t selected = 0U; bool present = false;
+    err = read_production_slot_selector(&selected, &present);
+    if (err != ESP_OK) return err;
+    if (!present) return ESP_ERR_NOT_FOUND;
+    if (validate_production_slot(selected) == ESP_OK) { *out_slot = selected; return ESP_OK; }
+    const uint8_t fallback = selected ^ 1U;
+    if (validate_production_slot(fallback) == ESP_OK) {
+        ESP_LOGW(TAG, "Production slot %c invalid; using validated slot %c",
+                 selected ? 'B' : 'A', fallback ? 'B' : 'A');
+        *out_slot = fallback;
+        return ESP_OK;
+    }
+    return ESP_ERR_INVALID_STATE;
+}
+
+static esp_err_t store_certificate_material(bool production, const char *hostname,
+                                            const uint8_t private_key[32],
+                                            const char *pem, size_t pem_len)
+{
+    if (!dns_name_is_valid(hostname) || private_key == NULL || pem == NULL || pem_len == 0U)
+        return ESP_ERR_INVALID_ARG;
+    esp_err_t err = validate_certificate_material(hostname, private_key, pem, pem_len);
+    if (err != ESP_OK) return err;
+    err = acme_storage_init();
+    if (err != ESP_OK) return err;
+
+    if (!production) {
+        nvs_handle_t handle;
+        err = nvs_open_from_partition("nvs_certs", "acme", NVS_READWRITE, &handle);
+        if (err != ESP_OK) return err;
+        err = nvs_set_blob(handle, ACME_CERT_KEY_NVS_KEY, private_key, 32U);
+        if (err == ESP_OK) err = nvs_set_blob(handle, ACME_CERT_PEM_NVS_KEY, pem, pem_len + 1U);
+        if (err == ESP_OK) err = nvs_set_str(handle, ACME_CERT_HOST_NVS_KEY, hostname);
+        if (err == ESP_OK) err = nvs_commit(handle);
+        nvs_close(handle);
+        return err;
+    }
+
+    uint8_t active = 0U;
+    err = resolve_production_slot(&active);
+    if (err == ESP_ERR_NOT_FOUND) active = 1U; /* first production write targets A */
+    else if (err != ESP_OK) return err;
+    const uint8_t target = active ^ 1U;
+
+    nvs_handle_t handle;
+    err = nvs_open_from_partition("nvs_certs", "acme", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_blob(handle, s_prod_slots[target].key, private_key, 32U);
+    if (err == ESP_OK) err = nvs_set_blob(handle, s_prod_slots[target].pem, pem, pem_len + 1U);
+    if (err == ESP_OK) err = nvs_set_str(handle, s_prod_slots[target].host, hostname);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    if (err != ESP_OK) return err;
+
+    err = validate_production_slot(target);
+    if (err != ESP_OK) return err;
+    err = commit_production_slot_selector(target);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Production certificate committed atomically to slot %c", target ? 'B' : 'A');
+    }
+    return err;
 }
 
 static void fingerprint_hex(const uint8_t digest[32], char out[65])
@@ -1580,6 +1847,60 @@ cleanup:
     return err;
 }
 
+esp_err_t acme_client_load_production_certificate_pem(char **out_pem, size_t *out_pem_length,
+                                                       char *out_hostname, size_t hostname_size)
+{
+    if (out_pem == NULL || out_pem_length == NULL || out_hostname == NULL || hostname_size == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_pem = NULL;
+    *out_pem_length = 0U;
+    out_hostname[0] = '\0';
+
+    esp_err_t err = acme_storage_init();
+    if (err != ESP_OK) return err;
+    uint8_t slot = 0U;
+    err = resolve_production_slot(&slot);
+    if (err != ESP_OK) return err;
+    const production_slot_names_t *names = &s_prod_slots[slot];
+
+    nvs_handle_t handle;
+    err = nvs_open_from_partition("nvs_certs", "acme", NVS_READONLY, &handle);
+    if (err != ESP_OK) return err;
+
+    size_t pem_len = 0U, host_len = 0U;
+    const esp_err_t pem_err = nvs_get_blob(handle, names->pem, NULL, &pem_len);
+    const esp_err_t host_err = nvs_get_str(handle, names->host, NULL, &host_len);
+    if (pem_err == ESP_ERR_NVS_NOT_FOUND || host_err == ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(handle);
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (pem_err != ESP_OK || host_err != ESP_OK || pem_len < 64U || pem_len > ACME_RESPONSE_MAX ||
+        host_len < 2U || host_len > hostname_size) {
+        nvs_close(handle);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    char *pem = calloc(1U, pem_len + 1U);
+    if (pem == NULL) {
+        nvs_close(handle);
+        return ESP_ERR_NO_MEM;
+    }
+    size_t read_pem_len = pem_len, read_host_len = hostname_size;
+    err = nvs_get_blob(handle, names->pem, pem, &read_pem_len);
+    if (err == ESP_OK) err = nvs_get_str(handle, names->host, out_hostname, &read_host_len);
+    nvs_close(handle);
+    if (err != ESP_OK) {
+        memset(pem, 0, pem_len + 1U);
+        free(pem);
+        return err;
+    }
+    pem[pem_len] = '\0';
+    *out_pem_length = (pem_len > 0U && pem[pem_len - 1U] == '\0') ? pem_len - 1U : pem_len;
+    *out_pem = pem;
+    return ESP_OK;
+}
+
 esp_err_t acme_client_inspect_stored_production_certificate(acme_certificate_inspection_t *out_status)
 {
     if (out_status == NULL) return ESP_ERR_INVALID_ARG;
@@ -1587,15 +1908,19 @@ esp_err_t acme_client_inspect_stored_production_certificate(acme_certificate_ins
 
     esp_err_t err = acme_storage_init();
     if (err != ESP_OK) return err;
+    uint8_t slot = 0U;
+    err = resolve_production_slot(&slot);
+    if (err != ESP_OK) return err;
+    const production_slot_names_t *names = &s_prod_slots[slot];
 
     nvs_handle_t handle;
     err = nvs_open_from_partition("nvs_certs", "acme", NVS_READONLY, &handle);
     if (err != ESP_OK) return err;
 
     size_t key_len = 0U, pem_len = 0U, host_len = 0U;
-    esp_err_t key_err = nvs_get_blob(handle, ACME_PROD_CERT_KEY_NVS_KEY, NULL, &key_len);
-    esp_err_t pem_err = nvs_get_blob(handle, ACME_PROD_CERT_PEM_NVS_KEY, NULL, &pem_len);
-    esp_err_t host_err = nvs_get_str(handle, ACME_PROD_CERT_HOST_NVS_KEY, NULL, &host_len);
+    esp_err_t key_err = nvs_get_blob(handle, names->key, NULL, &key_len);
+    esp_err_t pem_err = nvs_get_blob(handle, names->pem, NULL, &pem_len);
+    esp_err_t host_err = nvs_get_str(handle, names->host, NULL, &host_len);
     if (key_err == ESP_ERR_NVS_NOT_FOUND || pem_err == ESP_ERR_NVS_NOT_FOUND ||
         host_err == ESP_ERR_NVS_NOT_FOUND) {
         nvs_close(handle);
@@ -1613,9 +1938,9 @@ esp_err_t acme_client_inspect_stored_production_certificate(acme_certificate_ins
     if (pem == NULL) { nvs_close(handle); return ESP_ERR_NO_MEM; }
     char hostname[ACME_DNS_NAME_MAX_LENGTH + 1U];
     size_t read_key_len = sizeof(private_key), read_pem_len = pem_len, read_host_len = sizeof(hostname);
-    err = nvs_get_blob(handle, ACME_PROD_CERT_KEY_NVS_KEY, private_key, &read_key_len);
-    if (err == ESP_OK) err = nvs_get_blob(handle, ACME_PROD_CERT_PEM_NVS_KEY, pem, &read_pem_len);
-    if (err == ESP_OK) err = nvs_get_str(handle, ACME_PROD_CERT_HOST_NVS_KEY, hostname, &read_host_len);
+    err = nvs_get_blob(handle, names->key, private_key, &read_key_len);
+    if (err == ESP_OK) err = nvs_get_blob(handle, names->pem, pem, &read_pem_len);
+    if (err == ESP_OK) err = nvs_get_str(handle, names->host, hostname, &read_host_len);
     nvs_close(handle);
     if (err != ESP_OK) goto cleanup;
     pem[pem_len] = '\0';
@@ -1762,9 +2087,14 @@ static esp_err_t load_tls_credentials(bool production, acme_tls_credentials_t *o
     err = nvs_open_from_partition("nvs_certs", "acme", NVS_READONLY, &handle);
     if (err != ESP_OK) return err;
 
-    const char *key_name = production ? ACME_PROD_CERT_KEY_NVS_KEY : ACME_CERT_KEY_NVS_KEY;
-    const char *pem_name = production ? ACME_PROD_CERT_PEM_NVS_KEY : ACME_CERT_PEM_NVS_KEY;
-    const char *host_name = production ? ACME_PROD_CERT_HOST_NVS_KEY : ACME_CERT_HOST_NVS_KEY;
+    uint8_t production_slot = 0U;
+    if (production) {
+        err = resolve_production_slot(&production_slot);
+        if (err != ESP_OK) { nvs_close(handle); return err; }
+    }
+    const char *key_name = production ? s_prod_slots[production_slot].key : ACME_CERT_KEY_NVS_KEY;
+    const char *pem_name = production ? s_prod_slots[production_slot].pem : ACME_CERT_PEM_NVS_KEY;
+    const char *host_name = production ? s_prod_slots[production_slot].host : ACME_CERT_HOST_NVS_KEY;
     size_t key_len = 0U, pem_len = 0U, host_len = sizeof(out_credentials->hostname);
     err = nvs_get_blob(handle, key_name, NULL, &key_len);
     if (err == ESP_OK) err = nvs_get_blob(handle, pem_name, NULL, &pem_len);
@@ -1804,6 +2134,46 @@ esp_err_t acme_client_load_stored_tls_credentials(acme_tls_credentials_t *out_cr
 esp_err_t acme_client_load_production_tls_credentials(acme_tls_credentials_t *out_credentials)
 {
     return load_tls_credentials(true, out_credentials);
+}
+esp_err_t acme_client_prepare_production_storage(void)
+{
+    esp_err_t err = acme_storage_init();
+    if (err != ESP_OK) return err;
+    uint8_t slot = 0U;
+    err = resolve_production_slot(&slot);
+    if (err != ESP_OK) return err;
+    return retire_legacy_production_material_if_safe();
+}
+
+
+esp_err_t acme_client_get_production_storage_status(char *active_slot,
+                                                     bool *slot_a_valid,
+                                                     bool *slot_b_valid,
+                                                     bool *legacy_material_present)
+{
+    if (active_slot == NULL || slot_a_valid == NULL || slot_b_valid == NULL ||
+        legacy_material_present == NULL) return ESP_ERR_INVALID_ARG;
+    *active_slot = '?'; *slot_a_valid = false; *slot_b_valid = false; *legacy_material_present = false;
+    esp_err_t err = acme_storage_init();
+    if (err != ESP_OK) return err;
+
+    uint8_t effective = 0U;
+    err = resolve_production_slot(&effective);
+    if (err != ESP_OK) return err;
+    *active_slot = effective ? 'B' : 'A';
+    *slot_a_valid = validate_production_slot(0U) == ESP_OK;
+    *slot_b_valid = validate_production_slot(1U) == ESP_OK;
+
+    nvs_handle_t handle;
+    err = nvs_open_from_partition("nvs_certs", "acme", NVS_READONLY, &handle);
+    if (err != ESP_OK) return err;
+    size_t kl=0U, pl=0U, hl=0U;
+    const esp_err_t ke=nvs_get_blob(handle,ACME_PROD_CERT_KEY_NVS_KEY,NULL,&kl);
+    const esp_err_t pe=nvs_get_blob(handle,ACME_PROD_CERT_PEM_NVS_KEY,NULL,&pl);
+    const esp_err_t he=nvs_get_str(handle,ACME_PROD_CERT_HOST_NVS_KEY,NULL,&hl);
+    nvs_close(handle);
+    *legacy_material_present = (ke == ESP_OK && pe == ESP_OK && he == ESP_OK);
+    return ESP_OK;
 }
 
 esp_err_t acme_client_get_production_boot_selected(bool *out_selected)
