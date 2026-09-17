@@ -33,6 +33,14 @@ esp_err_t cloudflare_client_verify_dns01_txt(const char *api_token,
                                              const char *expected_record_name,
                                              int *out_http_status);
 
+/* Verify record type, name, and exact ACME TXT content before challenge trigger. */
+esp_err_t cloudflare_client_verify_dns01_txt_content(const char *api_token,
+                                                     const char *zone_id,
+                                                     const char *record_id,
+                                                     const char *expected_record_name,
+                                                     const char *expected_txt_value,
+                                                     int *out_http_status);
+
 /*
  * Delete a DNS-01 record only after verifying that the record ID still names
  * the expected TXT record. This prevents the management API from deleting an

@@ -3,6 +3,7 @@
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -23,12 +24,14 @@
 #include "esp_https_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "WEB";
 
 #define APP_WEB_CONSOLE_PORT                    443U
 #define APP_WEB_CONSOLE_STACK_SIZE              8192U
-#define APP_WEB_CONSOLE_MAX_HANDLERS            15U
+#define APP_WEB_CONSOLE_MAX_HANDLERS            17U
 #define APP_WEB_CONFIG_BODY_MAX                  1024U
 #define APP_WEB_CONSOLE_MAX_OPEN_SOCKETS        4U
 
@@ -1010,6 +1013,208 @@ static esp_err_t acme_staging_probe_handler(httpd_req_t *request)
     return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
 }
 
+
+static bool hostname_in_zone(const char *hostname, const char *zone)
+{
+    if (hostname == NULL || zone == NULL) return false;
+    if (strcmp(hostname, zone) == 0) return true;
+    const size_t hlen = strlen(hostname);
+    const size_t zlen = strlen(zone);
+    return hlen > zlen + 1U && hostname[hlen - zlen - 1U] == '.' &&
+           strcmp(hostname + hlen - zlen, zone) == 0;
+}
+
+static esp_err_t acme_staging_order_discover_handler(httpd_req_t *request)
+{
+    char body[APP_WEB_CONFIG_BODY_MAX];
+    if (receive_request_body(request, body, sizeof(body)) != ESP_OK) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid request body");
+    }
+    char hostname[ACME_DNS_NAME_MAX_LENGTH + 1U];
+    if (!extract_json_string(body, "hostname", hostname, sizeof(hostname))) {
+        memset(body, 0, sizeof(body));
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
+                                   "expected hostname");
+    }
+    memset(body, 0, sizeof(body));
+
+    device_config_snapshot_t config;
+    esp_err_t err = device_config_get_snapshot(&config);
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "configuration unavailable");
+    }
+    if (!config.cloudflare_configured) {
+        httpd_resp_set_status(request, "409 Conflict");
+        return httpd_resp_send(request, "Cloudflare is not configured", HTTPD_RESP_USE_STRLEN);
+    }
+    if (!hostname_in_zone(hostname, config.cloudflare_zone_name)) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
+                                   "hostname must be the configured Cloudflare zone or a subdomain");
+    }
+
+    acme_order_discovery_t status;
+    err = acme_client_discover_staging_order(hostname, &status);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "ACME staging order discovery failed: %s newOrder=%d auth=%d",
+                 esp_err_to_name(err), status.new_order_http_status,
+                 status.authorization_http_status);
+        httpd_resp_set_status(request, "502 Bad Gateway");
+        return httpd_resp_send(request,
+                               "Let's Encrypt staging order discovery failed",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+
+    char *response = calloc(1U, 3072U);
+    if (response == NULL) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "out of memory");
+    }
+    const int length = snprintf(
+        response, 3072U,
+        "{\"environment\":\"staging\",\"discovered\":true,"
+        "\"identifier\":\"%s\",\"new_order_http_status\":%d,"
+        "\"authorization_http_status\":%d,\"order_url\":\"%s\","
+        "\"authorization_url\":\"%s\",\"finalize_url\":\"%s\","
+        "\"challenge\":{\"type\":\"dns-01\",\"status\":\"%s\","
+        "\"url\":\"%s\",\"token\":\"%s\"},"
+        "\"dns01\":{\"record_name\":\"%s\",\"value\":\"%s\"},"
+        "\"challenge_triggered\":false,\"dns_record_created\":false}\n",
+        status.identifier, status.new_order_http_status,
+        status.authorization_http_status, status.order_url,
+        status.authorization_url, status.finalize_url,
+        status.challenge_status, status.challenge_url, status.challenge_token,
+        status.dns01_record_name, status.dns01_value);
+    if (length < 0 || length >= 3072) {
+        memset(response, 0, 3072U); free(response);
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "ACME order serialization failed");
+    }
+    httpd_resp_set_type(request, "application/json");
+    set_security_headers(request);
+    const esp_err_t send_err = httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+    memset(response, 0, 3072U);
+    free(response);
+    return send_err;
+}
+
+static esp_err_t acme_staging_dns01_validate_handler(httpd_req_t *request)
+{
+    char body[APP_WEB_CONFIG_BODY_MAX];
+    if (receive_request_body(request, body, sizeof(body)) != ESP_OK) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid request body");
+    }
+    char hostname[ACME_DNS_NAME_MAX_LENGTH + 1U];
+    if (!extract_json_string(body, "hostname", hostname, sizeof(hostname))) {
+        memset(body, 0, sizeof(body));
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "expected hostname");
+    }
+    memset(body, 0, sizeof(body));
+
+    device_config_snapshot_t config;
+    esp_err_t err = device_config_get_snapshot(&config);
+    if (err != ESP_OK) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                                   "configuration unavailable");
+    if (!config.cloudflare_configured) {
+        httpd_resp_set_status(request, "409 Conflict");
+        return httpd_resp_send(request, "Cloudflare is not configured", HTTPD_RESP_USE_STRLEN);
+    }
+    if (!hostname_in_zone(hostname, config.cloudflare_zone_name)) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
+                                   "hostname must be the configured Cloudflare zone or a subdomain");
+    }
+
+    device_config_cloudflare_credentials_t credentials;
+    err = device_config_get_cloudflare_credentials(&credentials);
+    if (err != ESP_OK) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                                   "Cloudflare credentials unavailable");
+
+    acme_order_discovery_t order;
+    err = acme_client_discover_staging_order(hostname, &order);
+    if (err != ESP_OK) {
+        memset(credentials.api_token, 0, sizeof(credentials.api_token));
+        httpd_resp_set_status(request, "502 Bad Gateway");
+        return httpd_resp_send(request, "ACME order discovery failed", HTTPD_RESP_USE_STRLEN);
+    }
+
+    char record_id[CLOUDFLARE_DNS_RECORD_ID_LENGTH + 1U] = {0};
+    int cf_create_status = 0;
+    int cf_verify_status = 0;
+    int cf_delete_status = 0;
+    bool dns_created = false;
+    bool dns_content_verified = false;
+    bool dns_deleted = false;
+
+    err = cloudflare_client_create_dns01_txt(credentials.api_token, credentials.zone_id,
+                                              order.dns01_record_name, order.dns01_value,
+                                              record_id, sizeof(record_id), &cf_create_status);
+    if (err == ESP_OK) dns_created = true;
+    if (err == ESP_OK) {
+        err = cloudflare_client_verify_dns01_txt_content(
+            credentials.api_token, credentials.zone_id, record_id,
+            order.dns01_record_name, order.dns01_value, &cf_verify_status);
+        if (err == ESP_OK) dns_content_verified = true;
+    }
+
+    acme_challenge_validation_t validation;
+    memset(&validation, 0, sizeof(validation));
+    esp_err_t validation_err = err;
+    if (dns_content_verified) {
+        /* Controlled propagation interval before notifying the CA. */
+        vTaskDelay(pdMS_TO_TICKS(10000));
+        validation_err = acme_client_validate_staging_dns01(&order, &validation);
+    }
+
+    /* Cleanup is attempted on success, invalid challenge, timeout, or local error. */
+    if (dns_created) {
+        const esp_err_t delete_err = cloudflare_client_delete_dns01_txt(
+            credentials.api_token, credentials.zone_id, record_id,
+            order.dns01_record_name, &cf_delete_status);
+        dns_deleted = (delete_err == ESP_OK);
+        if (delete_err != ESP_OK) {
+            ESP_LOGE(TAG, "ACME DNS-01 cleanup failed: %s http=%d record_id=%s",
+                     esp_err_to_name(delete_err), cf_delete_status, record_id);
+        }
+    }
+    memset(credentials.api_token, 0, sizeof(credentials.api_token));
+
+    char *response = calloc(1U, 4096U);
+    if (response == NULL) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                                      "out of memory");
+    const int length = snprintf(
+        response, 4096U,
+        "{\"environment\":\"staging\",\"identifier\":\"%s\"," 
+        "\"order_url\":\"%s\",\"authorization_url\":\"%s\"," 
+        "\"challenge_url\":\"%s\"," 
+        "\"dns01\":{\"record_name\":\"%s\",\"value\":\"%s\"," 
+        "\"record_id\":\"%s\",\"created\":%s,\"content_verified\":%s," 
+        "\"create_http_status\":%d,\"verify_http_status\":%d,\"deleted\":%s," 
+        "\"delete_http_status\":%d}," 
+        "\"challenge\":{\"triggered\":%s,\"valid\":%s," 
+        "\"trigger_http_status\":%d,\"poll_http_status\":%d,\"poll_count\":%u," 
+        "\"authorization_status\":\"%s\",\"status\":\"%s\"}}\n",
+        order.identifier, order.order_url, order.authorization_url, order.challenge_url,
+        order.dns01_record_name, order.dns01_value, record_id,
+        dns_created ? "true" : "false", dns_content_verified ? "true" : "false",
+        cf_create_status, cf_verify_status, dns_deleted ? "true" : "false", cf_delete_status,
+        validation.triggered ? "true" : "false", validation.valid ? "true" : "false",
+        validation.trigger_http_status, validation.poll_http_status, validation.poll_count,
+        validation.authorization_status, validation.challenge_status);
+    if (length < 0 || length >= 4096) {
+        memset(response, 0, 4096U); free(response);
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "ACME validation serialization failed");
+    }
+    httpd_resp_set_type(request, "application/json");
+    set_security_headers(request);
+    if (validation_err != ESP_OK || !validation.valid || !dns_deleted) {
+        httpd_resp_set_status(request, "502 Bad Gateway");
+    }
+    const esp_err_t send_err = httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+    memset(response, 0, 4096U); free(response);
+    return send_err;
+}
+
 static esp_err_t index_handler(httpd_req_t *request)
 {
     static const char html[] =
@@ -1268,6 +1473,21 @@ static const httpd_uri_t s_acme_staging_probe_uri = {
     .user_ctx = NULL,
 };
 
+
+static const httpd_uri_t s_acme_staging_order_discover_uri = {
+    .uri = "/api/v1/acme/staging/order/discover",
+    .method = HTTP_POST,
+    .handler = acme_staging_order_discover_handler,
+    .user_ctx = NULL,
+};
+
+static const httpd_uri_t s_acme_staging_dns01_validate_uri = {
+    .uri = "/api/v1/acme/staging/dns01/validate",
+    .method = HTTP_POST,
+    .handler = acme_staging_dns01_validate_handler,
+    .user_ctx = NULL,
+};
+
 esp_err_t web_console_start(void)
 {
     if (s_started) {
@@ -1360,6 +1580,10 @@ esp_err_t web_console_start(void)
     err = httpd_register_uri_handler(s_server, &s_acme_account_status_uri);
     if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
     err = httpd_register_uri_handler(s_server, &s_acme_account_provision_uri);
+    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
+    err = httpd_register_uri_handler(s_server, &s_acme_staging_order_discover_uri);
+    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
+    err = httpd_register_uri_handler(s_server, &s_acme_staging_dns01_validate_uri);
     if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
 
     s_started = true;

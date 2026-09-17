@@ -331,6 +331,65 @@ static esp_err_t cloudflare_verify_dns01_txt_sync(const char *api_token,
     return ESP_OK;
 }
 
+static bool json_txt_content_equals(const char *json, const char *expected)
+{
+    if (json == NULL || expected == NULL) return false;
+    const char *p = strstr(json, "\"content\"");
+    if (p == NULL) return false;
+    p = strchr(p, ':');
+    if (p == NULL) return false;
+    p = skip_ws(p + 1);
+    if (p == NULL || *p++ != '"') return false;
+
+    char decoded[CLOUDFLARE_DNS01_VALUE_MAX_LENGTH + 3U];
+    size_t used = 0U;
+    while (*p != '\0' && *p != '"' && used + 1U < sizeof(decoded)) {
+        if (*p == '\\') {
+            ++p;
+            if (*p != '"' && *p != '\\') return false;
+        }
+        decoded[used++] = *p++;
+    }
+    if (*p != '"') return false;
+    decoded[used] = '\0';
+
+    const size_t len = strlen(decoded);
+    if (len >= 2U && decoded[0] == '"' && decoded[len - 1U] == '"') {
+        decoded[len - 1U] = '\0';
+        return strcmp(decoded + 1U, expected) == 0;
+    }
+    return strcmp(decoded, expected) == 0;
+}
+
+static esp_err_t cloudflare_verify_dns01_txt_content_sync(const char *api_token,
+                                                           const char *zone_id,
+                                                           const char *record_id,
+                                                           const char *expected_record_name,
+                                                           const char *expected_txt_value,
+                                                           int *out_http_status)
+{
+    if (api_token == NULL || !is_hex_id(zone_id, APP_CLOUDFLARE_ZONE_ID_LENGTH) ||
+        !is_hex_id(record_id, CLOUDFLARE_DNS_RECORD_ID_LENGTH) ||
+        expected_record_name == NULL || !dns01_value_is_valid(expected_txt_value))
+        return ESP_ERR_INVALID_ARG;
+    char url[CF_URL_MAX];
+    if (snprintf(url, sizeof(url),
+                 "https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s",
+                 zone_id, record_id) >= (int)sizeof(url)) return ESP_ERR_INVALID_SIZE;
+    response_buffer_t response;
+    int status = 0;
+    esp_err_t err = cloudflare_http_request(api_token, HTTP_METHOD_GET, url, NULL,
+                                             &response, &status);
+    if (out_http_status != NULL) *out_http_status = status;
+    if (err != ESP_OK) return err;
+    if (status != 200 || !response_success(response.data)) return ESP_ERR_NOT_FOUND;
+    if (!json_string_equals(response.data, "type", "TXT") ||
+        !json_string_equals(response.data, "name", expected_record_name) ||
+        !json_txt_content_equals(response.data, expected_txt_value))
+        return ESP_ERR_INVALID_STATE;
+    return ESP_OK;
+}
+
 static esp_err_t cloudflare_delete_dns01_txt_sync(const char *api_token,
                                                    const char *zone_id,
                                                    const char *record_id,
@@ -369,6 +428,7 @@ typedef enum {
     CF_WORK_RESOLVE_ZONE = 0,
     CF_WORK_CREATE_DNS01,
     CF_WORK_VERIFY_DNS01,
+    CF_WORK_VERIFY_DNS01_CONTENT,
     CF_WORK_DELETE_DNS01,
 } cloudflare_work_type_t;
 
@@ -404,6 +464,11 @@ static void cloudflare_worker(void *argument)
         context->result = cloudflare_verify_dns01_txt_sync(
             context->api_token, context->zone_id, context->record_id,
             context->record_name, &context->http_status);
+        break;
+    case CF_WORK_VERIFY_DNS01_CONTENT:
+        context->result = cloudflare_verify_dns01_txt_content_sync(
+            context->api_token, context->zone_id, context->record_id,
+            context->record_name, context->txt_value, &context->http_status);
         break;
     case CF_WORK_DELETE_DNS01:
         context->result = cloudflare_delete_dns01_txt_sync(
@@ -502,6 +567,32 @@ esp_err_t cloudflare_client_verify_dns01_txt(const char *api_token,
         snprintf(ctx->zone_id, sizeof(ctx->zone_id), "%s", zone_id) >= (int)sizeof(ctx->zone_id) ||
         snprintf(ctx->record_id, sizeof(ctx->record_id), "%s", record_id) >= (int)sizeof(ctx->record_id) ||
         snprintf(ctx->record_name, sizeof(ctx->record_name), "%s", expected_record_name) >= (int)sizeof(ctx->record_name)) {
+        memset(ctx, 0, sizeof(*ctx)); free(ctx); return ESP_ERR_INVALID_SIZE;
+    }
+    esp_err_t result = run_worker(ctx);
+    if (out_http_status != NULL) *out_http_status = ctx->http_status;
+    memset(ctx, 0, sizeof(*ctx)); free(ctx);
+    return result;
+}
+
+esp_err_t cloudflare_client_verify_dns01_txt_content(const char *api_token,
+                                                     const char *zone_id,
+                                                     const char *record_id,
+                                                     const char *expected_record_name,
+                                                     const char *expected_txt_value,
+                                                     int *out_http_status)
+{
+    if (api_token == NULL || zone_id == NULL || record_id == NULL ||
+        expected_record_name == NULL || expected_txt_value == NULL) return ESP_ERR_INVALID_ARG;
+    if (out_http_status != NULL) *out_http_status = 0;
+    cloudflare_worker_context_t *ctx = calloc(1U, sizeof(*ctx));
+    if (ctx == NULL) return ESP_ERR_NO_MEM;
+    ctx->type = CF_WORK_VERIFY_DNS01_CONTENT;
+    if (snprintf(ctx->api_token, sizeof(ctx->api_token), "%s", api_token) >= (int)sizeof(ctx->api_token) ||
+        snprintf(ctx->zone_id, sizeof(ctx->zone_id), "%s", zone_id) >= (int)sizeof(ctx->zone_id) ||
+        snprintf(ctx->record_id, sizeof(ctx->record_id), "%s", record_id) >= (int)sizeof(ctx->record_id) ||
+        snprintf(ctx->record_name, sizeof(ctx->record_name), "%s", expected_record_name) >= (int)sizeof(ctx->record_name) ||
+        snprintf(ctx->txt_value, sizeof(ctx->txt_value), "%s", expected_txt_value) >= (int)sizeof(ctx->txt_value)) {
         memset(ctx, 0, sizeof(*ctx)); free(ctx); return ESP_ERR_INVALID_SIZE;
     }
     esp_err_t result = run_worker(ctx);
