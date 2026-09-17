@@ -3,6 +3,7 @@ idf_component_register(
         "app_main.c"
         "app_state.c"
         "device_config.c"
+        "cloudflare_client.c"
         "pps_service.c"
         "gnss_service.c"
         "clock_discipline.c"
@@ -23,6 +24,8 @@ idf_component_register(
         esp_timer
         esp_http_server
         esp_https_server
+        esp_http_client
+        mbedtls
         esp_driver_gpio
         esp_driver_gptimer
         esp_driver_uart

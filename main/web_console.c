@@ -9,6 +9,7 @@
 #include "app_config.h"
 #include "app_state.h"
 #include "clock_discipline.h"
+#include "cloudflare_client.h"
 #include "device_config.h"
 #include "eth_service.h"
 #include "gnss_service.h"
@@ -26,8 +27,8 @@ static const char *TAG = "WEB";
 
 #define APP_WEB_CONSOLE_PORT                    443U
 #define APP_WEB_CONSOLE_STACK_SIZE              8192U
-#define APP_WEB_CONSOLE_MAX_HANDLERS            8U
-#define APP_WEB_CONFIG_BODY_MAX                  160U
+#define APP_WEB_CONSOLE_MAX_HANDLERS            10U
+#define APP_WEB_CONFIG_BODY_MAX                  1024U
 #define APP_WEB_CONSOLE_MAX_OPEN_SOCKETS        4U
 
 static httpd_handle_t s_server;
@@ -464,29 +465,27 @@ static esp_err_t send_config_json(httpd_req_t *request)
 {
     device_config_snapshot_t config;
     esp_err_t err = device_config_get_snapshot(&config);
-
     if (err != ESP_OK) {
-        return httpd_resp_send_err(request,
-                                   HTTPD_500_INTERNAL_SERVER_ERROR,
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
                                    "configuration unavailable");
     }
-
-    char response[192];
-    const int length = snprintf(response,
-                                sizeof(response),
+    char response[768];
+    const int length = snprintf(response, sizeof(response),
                                 "{\"schema_version\":%" PRIu32
                                 ",\"generation\":%" PRIu32
-                                ",\"hostname\":\"%s\"}\n",
-                                config.schema_version,
-                                config.generation,
-                                config.hostname);
-
+                                ",\"hostname\":\"%s\""
+                                ",\"cloudflare\":{\"configured\":%s,"
+                                "\"zone_name\":\"%s\",\"zone_id\":\"%s\","
+                                "\"api_token_present\":%s}}\n",
+                                config.schema_version, config.generation, config.hostname,
+                                config.cloudflare_configured ? "true" : "false",
+                                config.cloudflare_configured ? config.cloudflare_zone_name : "",
+                                config.cloudflare_configured ? config.cloudflare_zone_id : "",
+                                config.cloudflare_configured ? "true" : "false");
     if (length < 0 || length >= (int)sizeof(response)) {
-        return httpd_resp_send_err(request,
-                                   HTTPD_500_INTERNAL_SERVER_ERROR,
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
                                    "configuration serialization failed");
     }
-
     httpd_resp_set_type(request, "application/json");
     set_security_headers(request);
     return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
@@ -594,6 +593,129 @@ static esp_err_t hostname_put_handler(httpd_req_t *request)
     return send_config_json(request);
 }
 
+static bool extract_json_string(const char *body, const char *name,
+                                char *output, size_t output_size)
+{
+    if (body == NULL || name == NULL || output == NULL || output_size == 0U) return false;
+    char key[80];
+    const int key_len = snprintf(key, sizeof(key), "\"%s\"", name);
+    if (key_len < 0 || key_len >= (int)sizeof(key)) return false;
+    const char *p = strstr(body, key);
+    if (p == NULL) return false;
+    p += strlen(key);
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+    if (*p++ != ':') return false;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+    if (*p++ != '"') return false;
+    size_t n = 0U;
+    while (*p != '\0' && *p != '"') {
+        if (*p == '\\' || (unsigned char)*p < 0x20U || n + 1U >= output_size) return false;
+        output[n++] = *p++;
+    }
+    if (*p != '"' || n == 0U) return false;
+    output[n] = '\0';
+    return true;
+}
+
+static esp_err_t receive_request_body(httpd_req_t *request, char *body, size_t body_size)
+{
+    if (request == NULL || body == NULL || body_size < 2U || request->content_len <= 0 ||
+        (size_t)request->content_len >= body_size) return ESP_ERR_INVALID_ARG;
+    size_t received = 0U;
+    while (received < (size_t)request->content_len) {
+        const int result = httpd_req_recv(request, body + received,
+                                          (size_t)request->content_len - received);
+        if (result == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (result <= 0) return ESP_FAIL;
+        received += (size_t)result;
+    }
+    body[received] = '\0';
+    return ESP_OK;
+}
+
+static esp_err_t cloudflare_put_handler(httpd_req_t *request)
+{
+    char body[APP_WEB_CONFIG_BODY_MAX];
+    if (receive_request_body(request, body, sizeof(body)) != ESP_OK) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid request body");
+    }
+    char token[APP_CLOUDFLARE_API_TOKEN_MAX_LENGTH + 1U];
+    char zone[APP_CLOUDFLARE_ZONE_NAME_MAX_LENGTH + 1U];
+    if (!extract_json_string(body, "api_token", token, sizeof(token)) ||
+        !extract_json_string(body, "zone_name", zone, sizeof(zone)) ||
+        !device_config_cloudflare_zone_is_valid(zone)) {
+        memset(token, 0, sizeof(token));
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
+                                   "expected api_token and valid zone_name");
+    }
+    memset(body, 0, sizeof(body));
+    char zone_id[APP_CLOUDFLARE_ZONE_ID_LENGTH + 1U];
+    int http_status = 0;
+    esp_err_t err = cloudflare_client_resolve_zone(token, zone, zone_id,
+                                                   sizeof(zone_id), &http_status);
+    if (err != ESP_OK) {
+        memset(token, 0, sizeof(token));
+        ESP_LOGW(TAG, "Cloudflare credential verification failed: err=%s http=%d",
+                 esp_err_to_name(err), http_status);
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
+                                   "Cloudflare token/zone verification failed");
+    }
+    err = device_config_set_cloudflare(token, zone, zone_id);
+    memset(token, 0, sizeof(token));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Cloudflare configuration commit failed: %s", esp_err_to_name(err));
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "configuration commit failed");
+    }
+    return send_config_json(request);
+}
+
+static esp_err_t cloudflare_delete_handler(httpd_req_t *request)
+{
+    const esp_err_t err = device_config_clear_cloudflare();
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "configuration commit failed");
+    }
+    return send_config_json(request);
+}
+
+static esp_err_t cloudflare_verify_handler(httpd_req_t *request)
+{
+    device_config_cloudflare_credentials_t credentials;
+    esp_err_t err = device_config_get_cloudflare_credentials(&credentials);
+    if (err == ESP_ERR_NOT_FOUND) {
+        return httpd_resp_send_err(request, HTTPD_404_NOT_FOUND, "Cloudflare is not configured");
+    }
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "configuration unavailable");
+    }
+    char resolved_id[APP_CLOUDFLARE_ZONE_ID_LENGTH + 1U];
+    int http_status = 0;
+    err = cloudflare_client_resolve_zone(credentials.api_token, credentials.zone_name,
+                                         resolved_id, sizeof(resolved_id), &http_status);
+    memset(credentials.api_token, 0, sizeof(credentials.api_token));
+    if (err != ESP_OK || strcmp(resolved_id, credentials.zone_id) != 0) {
+        httpd_resp_set_status(request, "502 Bad Gateway");
+        return httpd_resp_send(request,
+                               "Cloudflare verification failed",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+    char response[384];
+    const int length = snprintf(response, sizeof(response),
+                                "{\"verified\":true,\"zone_name\":\"%s\","
+                                "\"zone_id\":\"%s\",\"http_status\":%d}\n",
+                                credentials.zone_name, credentials.zone_id, http_status);
+    if (length < 0 || length >= (int)sizeof(response)) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "serialization failed");
+    }
+    httpd_resp_set_type(request, "application/json");
+    set_security_headers(request);
+    return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t index_handler(httpd_req_t *request)
 {
     static const char html[] =
@@ -643,7 +765,7 @@ static esp_err_t index_handler(httpd_req_t *request)
         "<footer>"
         "mTLS management endpoints: <code>/api/v1/status</code> &middot; "
         "<code>/api/v1/health</code> &middot; <code>/metrics</code> &middot; "
-        "<code>GET /api/v1/config</code> &middot; <code>PUT /api/v1/config/hostname</code>"
+        "<code>GET /api/v1/config</code> &middot; <code>PUT /api/v1/config/hostname</code> &middot; <code>PUT/DELETE /api/v1/config/cloudflare</code>"
         "</footer>"
         "</main>"
         "<script>"
@@ -800,6 +922,21 @@ static const httpd_uri_t s_hostname_put_uri = {
     .user_ctx = NULL,
 };
 
+static const httpd_uri_t s_cloudflare_put_uri = {
+    .uri = "/api/v1/config/cloudflare", .method = HTTP_PUT,
+    .handler = cloudflare_put_handler, .user_ctx = NULL,
+};
+
+static const httpd_uri_t s_cloudflare_delete_uri = {
+    .uri = "/api/v1/config/cloudflare", .method = HTTP_DELETE,
+    .handler = cloudflare_delete_handler, .user_ctx = NULL,
+};
+
+static const httpd_uri_t s_cloudflare_verify_uri = {
+    .uri = "/api/v1/config/cloudflare/verify", .method = HTTP_POST,
+    .handler = cloudflare_verify_handler, .user_ctx = NULL,
+};
+
 esp_err_t web_console_start(void)
 {
     if (s_started) {
@@ -874,6 +1011,13 @@ esp_err_t web_console_start(void)
         s_server = NULL;
         return err;
     }
+
+    err = httpd_register_uri_handler(s_server, &s_cloudflare_put_uri);
+    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
+    err = httpd_register_uri_handler(s_server, &s_cloudflare_delete_uri);
+    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
+    err = httpd_register_uri_handler(s_server, &s_cloudflare_verify_uri);
+    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
 
     s_started = true;
 
