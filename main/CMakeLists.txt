@@ -4,6 +4,8 @@ idf_component_register(
         "app_state.c"
         "device_config.c"
         "cloudflare_client.c"
+        "acme_client.c"
+        "acme_storage.c"
         "pps_service.c"
         "gnss_service.c"
         "clock_discipline.c"
@@ -31,6 +33,7 @@ idf_component_register(
         esp_driver_uart
         esp_hw_support
         nvs_flash
+        bootloader_support
         freertos
         lwip
         log

@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "app_config.h"
+#include "acme_client.h"
 #include "app_state.h"
 #include "clock_discipline.h"
 #include "cloudflare_client.h"
@@ -27,7 +28,7 @@ static const char *TAG = "WEB";
 
 #define APP_WEB_CONSOLE_PORT                    443U
 #define APP_WEB_CONSOLE_STACK_SIZE              8192U
-#define APP_WEB_CONSOLE_MAX_HANDLERS            12U
+#define APP_WEB_CONSOLE_MAX_HANDLERS            15U
 #define APP_WEB_CONFIG_BODY_MAX                  1024U
 #define APP_WEB_CONSOLE_MAX_OPEN_SOCKETS        4U
 
@@ -898,6 +899,117 @@ static esp_err_t dns01_delete_handler(httpd_req_t *request)
     return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
 }
 
+
+static esp_err_t acme_account_status_handler(httpd_req_t *request)
+{
+    acme_account_status_t status;
+    const esp_err_t err = acme_client_get_account_status(&status);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "ACME account status failed: %s", esp_err_to_name(err));
+        httpd_resp_set_status(request, "503 Service Unavailable");
+        return httpd_resp_send(request,
+                               "ACME account storage unavailable",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+
+    char response[1100];
+    const int length = snprintf(
+        response, sizeof(response),
+        "{\"environment\":\"staging\",\"key_present\":%s,"
+        "\"registered\":%s,\"account_url\":\"%s\","
+        "\"jwk_thumbprint\":\"%s\"}\n",
+        status.key_present ? "true" : "false",
+        status.registered ? "true" : "false",
+        status.account_url,
+        status.jwk_thumbprint);
+
+    if (length < 0 || length >= (int)sizeof(response)) {
+        return httpd_resp_send_err(request,
+                                   HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "ACME status serialization failed");
+    }
+
+    httpd_resp_set_type(request, "application/json");
+    set_security_headers(request);
+    return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t acme_account_provision_handler(httpd_req_t *request)
+{
+    acme_account_status_t status;
+    const esp_err_t err =
+        acme_client_provision_staging_account(&status);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "ACME staging account provisioning failed: %s http=%d",
+                 esp_err_to_name(err), status.http_status);
+        httpd_resp_set_status(request, "502 Bad Gateway");
+        return httpd_resp_send(request,
+                               "Let's Encrypt staging account provisioning failed",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+
+    char response[1100];
+    const int length = snprintf(
+        response, sizeof(response),
+        "{\"environment\":\"staging\",\"key_present\":%s,"
+        "\"registered\":%s,\"http_status\":%d,"
+        "\"account_url\":\"%s\",\"jwk_thumbprint\":\"%s\"}\n",
+        status.key_present ? "true" : "false",
+        status.registered ? "true" : "false",
+        status.http_status,
+        status.account_url,
+        status.jwk_thumbprint);
+
+    if (length < 0 || length >= (int)sizeof(response)) {
+        return httpd_resp_send_err(request,
+                                   HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "ACME account serialization failed");
+    }
+
+    httpd_resp_set_type(request, "application/json");
+    set_security_headers(request);
+    return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t acme_staging_probe_handler(httpd_req_t *request)
+{
+    acme_directory_status_t status;
+    const esp_err_t err = acme_client_probe_staging(&status);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "ACME staging probe failed: %s http=%d",
+                 esp_err_to_name(err), status.http_status);
+        httpd_resp_set_status(request, "502 Bad Gateway");
+        return httpd_resp_send(request,
+                               "Let's Encrypt staging ACME directory probe failed",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+
+    char response[1400];
+    const int length = snprintf(
+        response,
+        sizeof(response),
+        "{\"environment\":\"staging\",\"reachable\":true,"
+        "\"http_status\":%d,\"new_nonce\":\"%s\","
+        "\"new_account\":\"%s\",\"new_order\":\"%s\"}\n",
+        status.http_status,
+        status.new_nonce_url,
+        status.new_account_url,
+        status.new_order_url);
+
+    if (length < 0 || length >= (int)sizeof(response)) {
+        return httpd_resp_send_err(request,
+                                   HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "ACME status serialization failed");
+    }
+
+    httpd_resp_set_type(request, "application/json");
+    set_security_headers(request);
+    return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t index_handler(httpd_req_t *request)
 {
     static const char html[] =
@@ -1134,6 +1246,28 @@ static const httpd_uri_t s_dns01_delete_uri = {
     .handler = dns01_delete_handler, .user_ctx = NULL,
 };
 
+
+static const httpd_uri_t s_acme_account_status_uri = {
+    .uri = "/api/v1/acme/account",
+    .method = HTTP_GET,
+    .handler = acme_account_status_handler,
+    .user_ctx = NULL,
+};
+
+static const httpd_uri_t s_acme_account_provision_uri = {
+    .uri = "/api/v1/acme/account",
+    .method = HTTP_POST,
+    .handler = acme_account_provision_handler,
+    .user_ctx = NULL,
+};
+
+static const httpd_uri_t s_acme_staging_probe_uri = {
+    .uri = "/api/v1/acme/staging/probe",
+    .method = HTTP_POST,
+    .handler = acme_staging_probe_handler,
+    .user_ctx = NULL,
+};
+
 esp_err_t web_console_start(void)
 {
     if (s_started) {
@@ -1220,6 +1354,12 @@ esp_err_t web_console_start(void)
     err = httpd_register_uri_handler(s_server, &s_dns01_query_uri);
     if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
     err = httpd_register_uri_handler(s_server, &s_dns01_delete_uri);
+    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
+    err = httpd_register_uri_handler(s_server, &s_acme_staging_probe_uri);
+    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
+    err = httpd_register_uri_handler(s_server, &s_acme_account_status_uri);
+    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
+    err = httpd_register_uri_handler(s_server, &s_acme_account_provision_uri);
     if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
 
     s_started = true;
