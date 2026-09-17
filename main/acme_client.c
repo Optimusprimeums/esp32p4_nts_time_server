@@ -12,6 +12,7 @@
 #include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs.h"
 #include "psa/crypto.h"
 
 static const char *TAG = "ACME";
@@ -19,7 +20,7 @@ static const char *TAG = "ACME";
 #define ACME_STAGING_DIRECTORY_URL \
     "https://acme-staging-v02.api.letsencrypt.org/directory"
 
-#define ACME_RESPONSE_MAX       8192U
+#define ACME_RESPONSE_MAX      16384U
 #define ACME_NONCE_MAX           256U
 #define ACME_JWK_MAX             256U
 #define ACME_PROTECTED_MAX       896U
@@ -40,6 +41,7 @@ typedef enum {
     ACME_WORK_PROVISION_ACCOUNT,
     ACME_WORK_DISCOVER_ORDER,
     ACME_WORK_VALIDATE_DNS01,
+    ACME_WORK_FINALIZE_ORDER,
 } acme_work_type_t;
 
 typedef struct {
@@ -49,6 +51,7 @@ typedef struct {
     acme_account_status_t account;
     acme_order_discovery_t order;
     acme_challenge_validation_t validation;
+    acme_certificate_issue_status_t certificate;
     char requested_hostname[ACME_DNS_NAME_MAX_LENGTH + 1U];
     esp_err_t result;
 } acme_worker_context_t;
@@ -1173,6 +1176,291 @@ cleanup:
     return err;
 }
 
+
+#define ACME_CERT_KEY_NVS_KEY "cert_key"
+#define ACME_CERT_PEM_NVS_KEY "cert_pem"
+#define ACME_CERT_HOST_NVS_KEY "cert_host"
+#define ACME_CERT_PRIVATE_KEY_LENGTH 32U
+#define ACME_CSR_MAX 1024U
+
+static esp_err_t der_put_length(uint8_t *out, size_t out_size, size_t length, size_t *written)
+{
+    if (out == NULL || written == NULL) return ESP_ERR_INVALID_ARG;
+    if (length < 128U) {
+        if (out_size < 1U) return ESP_ERR_INVALID_SIZE;
+        out[0] = (uint8_t)length; *written = 1U; return ESP_OK;
+    }
+    if (length <= 255U) {
+        if (out_size < 2U) return ESP_ERR_INVALID_SIZE;
+        out[0] = 0x81U; out[1] = (uint8_t)length; *written = 2U; return ESP_OK;
+    }
+    if (length <= 65535U) {
+        if (out_size < 3U) return ESP_ERR_INVALID_SIZE;
+        out[0] = 0x82U; out[1] = (uint8_t)(length >> 8); out[2] = (uint8_t)length;
+        *written = 3U; return ESP_OK;
+    }
+    return ESP_ERR_INVALID_SIZE;
+}
+
+static esp_err_t der_wrap(uint8_t tag, const uint8_t *content, size_t content_len,
+                          uint8_t *out, size_t out_size, size_t *out_len)
+{
+    if (out == NULL || out_len == NULL || (content_len != 0U && content == NULL)) return ESP_ERR_INVALID_ARG;
+    size_t ll = 0U;
+    if (out_size < 2U) return ESP_ERR_INVALID_SIZE;
+    out[0] = tag;
+    esp_err_t err = der_put_length(out + 1U, out_size - 1U, content_len, &ll);
+    if (err != ESP_OK || 1U + ll + content_len > out_size) return ESP_ERR_INVALID_SIZE;
+    if (content_len != 0U) memcpy(out + 1U + ll, content, content_len);
+    *out_len = 1U + ll + content_len;
+    return ESP_OK;
+}
+
+static esp_err_t der_concat2(const uint8_t *a, size_t al, const uint8_t *b, size_t bl,
+                             uint8_t *out, size_t out_size, size_t *out_len)
+{
+    if (al + bl > out_size) return ESP_ERR_INVALID_SIZE;
+    memcpy(out, a, al); memcpy(out + al, b, bl); *out_len = al + bl; return ESP_OK;
+}
+
+static esp_err_t der_concat3(const uint8_t *a, size_t al, const uint8_t *b, size_t bl,
+                             const uint8_t *c, size_t cl, uint8_t *out, size_t out_size,
+                             size_t *out_len)
+{
+    if (al + bl + cl > out_size) return ESP_ERR_INVALID_SIZE;
+    memcpy(out, a, al); memcpy(out + al, b, bl); memcpy(out + al + bl, c, cl);
+    *out_len = al + bl + cl; return ESP_OK;
+}
+
+static esp_err_t ecdsa_raw_to_der(const uint8_t raw[64], uint8_t *out, size_t out_size, size_t *out_len)
+{
+    uint8_t ints[80]; size_t used = 0U;
+    for (unsigned part = 0U; part < 2U; ++part) {
+        const uint8_t *v = raw + part * 32U;
+        size_t off = 0U;
+        while (off < 31U && v[off] == 0U) ++off;
+        const size_t n = 32U - off;
+        const bool lead_zero = (v[off] & 0x80U) != 0U;
+        const size_t ilen = n + (lead_zero ? 1U : 0U);
+        if (used + 2U + ilen > sizeof(ints) || ilen >= 128U) return ESP_ERR_INVALID_SIZE;
+        ints[used++] = 0x02U; ints[used++] = (uint8_t)ilen;
+        if (lead_zero) ints[used++] = 0U;
+        memcpy(ints + used, v + off, n); used += n;
+    }
+    return der_wrap(0x30U, ints, used, out, out_size, out_len);
+}
+
+static esp_err_t generate_certificate_key(uint8_t private_key[32], uint8_t public_key[65])
+{
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
+    psa_set_key_bits(&attributes, 256U);
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_EXPORT | PSA_KEY_USAGE_SIGN_HASH);
+    psa_set_key_algorithm(&attributes, PSA_ALG_ECDSA(PSA_ALG_SHA_256));
+    psa_key_id_t key_id = 0;
+    psa_status_t ps = psa_generate_key(&attributes, &key_id);
+    psa_reset_key_attributes(&attributes);
+    if (ps != PSA_SUCCESS) return ESP_FAIL;
+    size_t private_len = 0U, public_len = 0U;
+    ps = psa_export_key(key_id, private_key, 32U, &private_len);
+    if (ps == PSA_SUCCESS) ps = psa_export_public_key(key_id, public_key, 65U, &public_len);
+    (void)psa_destroy_key(key_id);
+    if (ps != PSA_SUCCESS || private_len != 32U || public_len != 65U || public_key[0] != 0x04U) {
+        memset(private_key, 0, 32U); memset(public_key, 0, 65U); return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t build_csr_der(const char *hostname, const uint8_t private_key[32],
+                               const uint8_t public_key[65], uint8_t *out,
+                               size_t out_size, size_t *out_len)
+{
+    if (!dns_name_is_valid(hostname) || private_key == NULL || public_key == NULL ||
+        out == NULL || out_len == NULL) return ESP_ERR_INVALID_ARG;
+    /* Fixed DER OIDs. */
+    static const uint8_t oid_cn[] = {0x06,0x03,0x55,0x04,0x03};
+    static const uint8_t oid_ec_pub[] = {0x06,0x07,0x2A,0x86,0x48,0xCE,0x3D,0x02,0x01};
+    static const uint8_t oid_p256[] = {0x06,0x08,0x2A,0x86,0x48,0xCE,0x3D,0x03,0x01,0x07};
+    static const uint8_t oid_ext_req[] = {0x06,0x09,0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x09,0x0E};
+    static const uint8_t oid_san[] = {0x06,0x03,0x55,0x1D,0x11};
+    static const uint8_t oid_ecdsa_sha256[] = {0x06,0x08,0x2A,0x86,0x48,0xCE,0x3D,0x04,0x03,0x02};
+    uint8_t a[1024], b[1024], c[1024], d[1024]; size_t al, bl, cl, dl;
+
+    /* subject: CN=hostname */
+    esp_err_t err = der_wrap(0x0CU, (const uint8_t *)hostname, strlen(hostname), a, sizeof(a), &al);
+    if (err != ESP_OK) return err;
+    err = der_concat2(oid_cn, sizeof(oid_cn), a, al, b, sizeof(b), &bl);
+    if (err == ESP_OK) err = der_wrap(0x30U, b, bl, a, sizeof(a), &al);
+    if (err == ESP_OK) err = der_wrap(0x31U, a, al, b, sizeof(b), &bl);
+    if (err == ESP_OK) err = der_wrap(0x30U, b, bl, c, sizeof(c), &cl);
+    if (err != ESP_OK) return err;
+    uint8_t subject[512]; size_t subject_len = cl; memcpy(subject, c, cl);
+
+    /* SubjectPublicKeyInfo */
+    err = der_concat2(oid_ec_pub, sizeof(oid_ec_pub), oid_p256, sizeof(oid_p256), a, sizeof(a), &al);
+    if (err == ESP_OK) err = der_wrap(0x30U, a, al, b, sizeof(b), &bl);
+    uint8_t bitpub[66]; bitpub[0] = 0U; memcpy(bitpub + 1U, public_key, 65U);
+    if (err == ESP_OK) err = der_wrap(0x03U, bitpub, sizeof(bitpub), c, sizeof(c), &cl);
+    if (err == ESP_OK) err = der_concat2(b, bl, c, cl, a, sizeof(a), &al);
+    if (err == ESP_OK) err = der_wrap(0x30U, a, al, d, sizeof(d), &dl);
+    if (err != ESP_OK) return err;
+    uint8_t spki[256]; size_t spki_len = dl; memcpy(spki, d, dl);
+
+    /* extensionRequest -> subjectAltName dNSName */
+    err = der_wrap(0x82U, (const uint8_t *)hostname, strlen(hostname), a, sizeof(a), &al);
+    if (err == ESP_OK) err = der_wrap(0x30U, a, al, b, sizeof(b), &bl); /* GeneralNames */
+    if (err == ESP_OK) err = der_wrap(0x04U, b, bl, c, sizeof(c), &cl); /* extnValue */
+    if (err == ESP_OK) err = der_concat2(oid_san, sizeof(oid_san), c, cl, a, sizeof(a), &al);
+    if (err == ESP_OK) err = der_wrap(0x30U, a, al, b, sizeof(b), &bl); /* Extension */
+    if (err == ESP_OK) err = der_wrap(0x30U, b, bl, c, sizeof(c), &cl); /* Extensions */
+    if (err == ESP_OK) err = der_wrap(0x31U, c, cl, d, sizeof(d), &dl); /* SET */
+    if (err == ESP_OK) err = der_concat2(oid_ext_req, sizeof(oid_ext_req), d, dl, a, sizeof(a), &al);
+    if (err == ESP_OK) err = der_wrap(0x30U, a, al, b, sizeof(b), &bl); /* Attribute */
+    if (err == ESP_OK) err = der_wrap(0xA0U, b, bl, c, sizeof(c), &cl); /* attributes [0] */
+    if (err != ESP_OK) return err;
+    uint8_t attrs[512]; size_t attrs_len = cl; memcpy(attrs, c, cl);
+
+    static const uint8_t version0[] = {0x02,0x01,0x00};
+    err = der_concat3(version0, sizeof(version0), subject, subject_len, spki, spki_len,
+                      a, sizeof(a), &al);
+    if (err == ESP_OK) err = der_concat2(a, al, attrs, attrs_len, b, sizeof(b), &bl);
+    if (err == ESP_OK) err = der_wrap(0x30U, b, bl, c, sizeof(c), &cl); /* CRI */
+    if (err != ESP_OK) return err;
+
+    uint8_t digest[32], raw_sig[64], der_sig[80]; size_t der_sig_len = 0U;
+    err = sha256_bytes(c, cl, digest);
+    if (err == ESP_OK) err = sign_es256(private_key, digest, raw_sig);
+    memset(digest, 0, sizeof(digest));
+    if (err == ESP_OK) err = ecdsa_raw_to_der(raw_sig, der_sig, sizeof(der_sig), &der_sig_len);
+    memset(raw_sig, 0, sizeof(raw_sig));
+    if (err != ESP_OK) return err;
+
+    err = der_wrap(0x30U, oid_ecdsa_sha256, sizeof(oid_ecdsa_sha256), a, sizeof(a), &al);
+    uint8_t sigbits[81];
+    if (der_sig_len + 1U > sizeof(sigbits)) return ESP_ERR_INVALID_SIZE;
+    sigbits[0] = 0U; memcpy(sigbits + 1U, der_sig, der_sig_len);
+    if (err == ESP_OK) err = der_wrap(0x03U, sigbits, der_sig_len + 1U, b, sizeof(b), &bl);
+    if (err == ESP_OK) err = der_concat3(c, cl, a, al, b, bl, d, sizeof(d), &dl);
+    if (err == ESP_OK) err = der_wrap(0x30U, d, dl, out, out_size, out_len);
+    memset(der_sig, 0, sizeof(der_sig));
+    return err;
+}
+
+static esp_err_t store_certificate_material(const char *hostname,
+                                            const uint8_t private_key[32],
+                                            const char *pem, size_t pem_len)
+{
+    if (!dns_name_is_valid(hostname) || private_key == NULL || pem == NULL || pem_len == 0U) return ESP_ERR_INVALID_ARG;
+    esp_err_t err = acme_storage_init();
+    if (err != ESP_OK) return err;
+    nvs_handle_t handle;
+    err = nvs_open_from_partition("nvs_certs", "acme", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_blob(handle, ACME_CERT_KEY_NVS_KEY, private_key, 32U);
+    if (err == ESP_OK) err = nvs_set_blob(handle, ACME_CERT_PEM_NVS_KEY, pem, pem_len + 1U);
+    if (err == ESP_OK) err = nvs_set_str(handle, ACME_CERT_HOST_NVS_KEY, hostname);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return err;
+}
+
+static esp_err_t finalize_order_sync(const acme_order_discovery_t *order,
+                                     acme_certificate_issue_status_t *out)
+{
+    if (order == NULL || out == NULL || !order->discovered || !is_https_url(order->order_url) ||
+        !is_https_url(order->finalize_url) || !dns_name_is_valid(order->identifier)) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->identifier, sizeof(out->identifier), "%s", order->identifier);
+
+    esp_err_t err = acme_storage_init();
+    if (err != ESP_OK) return err;
+    uint8_t account_key[32];
+    err = acme_storage_load_private_key(account_key);
+    if (err != ESP_OK) return err;
+    char kid[ACME_URL_MAX_LENGTH];
+    err = acme_storage_load_account_url(kid, sizeof(kid));
+    if (err != ESP_OK || !is_https_url(kid)) { memset(account_key,0,sizeof(account_key)); return ESP_ERR_INVALID_STATE; }
+
+    uint8_t cert_key[32], public_key[65], csr[ACME_CSR_MAX]; size_t csr_len = 0U;
+    memset(cert_key,0,sizeof(cert_key)); memset(public_key,0,sizeof(public_key));
+    err = generate_certificate_key(cert_key, public_key);
+    if (err != ESP_OK) goto cleanup;
+    err = build_csr_der(order->identifier, cert_key, public_key, csr, sizeof(csr), &csr_len);
+    memset(public_key,0,sizeof(public_key));
+    if (err != ESP_OK) goto cleanup;
+    char csr64[1536];
+    err = base64url(csr, csr_len, csr64, sizeof(csr64));
+    memset(csr,0,sizeof(csr));
+    if (err != ESP_OK) goto cleanup;
+
+    char payload[1664];
+    int n = snprintf(payload, sizeof(payload), "{\"csr\":\"%s\"}", csr64);
+    memset(csr64,0,sizeof(csr64));
+    if (n < 0 || n >= (int)sizeof(payload)) { err = ESP_ERR_INVALID_SIZE; goto cleanup; }
+
+    acme_directory_status_t directory;
+    err = probe_staging_sync(&directory);
+    if (err != ESP_OK) goto cleanup;
+    acme_response_buffer_t *response = calloc(1U, sizeof(*response));
+    if (response == NULL) { err = ESP_ERR_NO_MEM; goto cleanup; }
+    int status = 0;
+    err = signed_request(directory.new_nonce_url, order->finalize_url, kid, payload,
+                         account_key, response, &status);
+    memset(payload,0,sizeof(payload));
+    out->finalize_http_status = status;
+    if (err != ESP_OK || status != 200) {
+        if (err == ESP_OK) err = ESP_ERR_INVALID_RESPONSE;
+        goto response_cleanup;
+    }
+    out->finalized = true;
+
+    err = ESP_ERR_TIMEOUT;
+    for (unsigned attempt = 1U; attempt <= 30U; ++attempt) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        memset(response, 0, sizeof(*response)); status = 0;
+        esp_err_t poll_err = signed_request(directory.new_nonce_url, order->order_url, kid, "",
+                                            account_key, response, &status);
+        out->order_poll_http_status = status; out->order_poll_count = attempt;
+        if (poll_err != ESP_OK || status != 200 ||
+            !extract_json_string(response->data, "status", out->order_status, sizeof(out->order_status))) {
+            err = poll_err != ESP_OK ? poll_err : ESP_ERR_INVALID_RESPONSE; break;
+        }
+        if (strcmp(out->order_status, "valid") == 0) {
+            if (!extract_json_string(response->data, "certificate", out->certificate_url,
+                                     sizeof(out->certificate_url)) || !is_https_url(out->certificate_url)) {
+                err = ESP_ERR_INVALID_RESPONSE;
+            } else err = ESP_OK;
+            break;
+        }
+        if (strcmp(out->order_status, "invalid") == 0) { err = ESP_ERR_INVALID_RESPONSE; break; }
+    }
+    if (err != ESP_OK) goto response_cleanup;
+
+    memset(response, 0, sizeof(*response)); status = 0;
+    err = signed_request(directory.new_nonce_url, out->certificate_url, kid, "",
+                         account_key, response, &status);
+    out->certificate_http_status = status;
+    if (err != ESP_OK || status != 200 || response->used == 0U ||
+        strstr(response->data, "-----BEGIN CERTIFICATE-----") == NULL) {
+        if (err == ESP_OK) err = ESP_ERR_INVALID_RESPONSE;
+        goto response_cleanup;
+    }
+    out->certificate_retrieved = true;
+    out->certificate_pem_length = response->used;
+    err = store_certificate_material(order->identifier, cert_key, response->data, response->used);
+    if (err == ESP_OK) {
+        out->stored = true;
+        ESP_LOGI(TAG, "Stored staging certificate/key for %s in protected nvs_certs", order->identifier);
+    }
+
+response_cleanup:
+    memset(response,0,sizeof(*response)); free(response);
+cleanup:
+    memset(account_key,0,sizeof(account_key)); memset(cert_key,0,sizeof(cert_key));
+    memset(kid,0,sizeof(kid));
+    return err;
+}
+
 static void acme_worker(void *argument)
 {
     acme_worker_context_t *context =
@@ -1186,6 +1474,8 @@ static void acme_worker(void *argument)
         context->result = discover_order_sync(context->requested_hostname, &context->order);
     } else if (context->type == ACME_WORK_VALIDATE_DNS01) {
         context->result = validate_dns01_sync(&context->order, &context->validation);
+    } else if (context->type == ACME_WORK_FINALIZE_ORDER) {
+        context->result = finalize_order_sync(&context->order, &context->certificate);
     } else {
         context->result = ESP_ERR_INVALID_ARG;
     }
@@ -1277,6 +1567,23 @@ esp_err_t acme_client_validate_staging_dns01(const acme_order_discovery_t *order
     context->order = *order;
     esp_err_t result = run_worker(context);
     *out_status = context->validation;
+    memset(context, 0, sizeof(*context));
+    free(context);
+    return result;
+}
+
+
+esp_err_t acme_client_finalize_staging_order(const acme_order_discovery_t *order,
+                                             acme_certificate_issue_status_t *out_status)
+{
+    if (order == NULL || out_status == NULL) return ESP_ERR_INVALID_ARG;
+    memset(out_status, 0, sizeof(*out_status));
+    acme_worker_context_t *context = calloc(1U, sizeof(*context));
+    if (context == NULL) return ESP_ERR_NO_MEM;
+    context->type = ACME_WORK_FINALIZE_ORDER;
+    context->order = *order;
+    esp_err_t result = run_worker(context);
+    *out_status = context->certificate;
     memset(context, 0, sizeof(*context));
     free(context);
     return result;

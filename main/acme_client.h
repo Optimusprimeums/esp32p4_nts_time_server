@@ -56,6 +56,20 @@ typedef struct {
     char challenge_status[24];
 } acme_challenge_validation_t;
 
+typedef struct {
+    bool finalized;
+    bool certificate_retrieved;
+    bool stored;
+    int finalize_http_status;
+    int order_poll_http_status;
+    int certificate_http_status;
+    unsigned order_poll_count;
+    size_t certificate_pem_length;
+    char identifier[ACME_DNS_NAME_MAX_LENGTH + 1U];
+    char order_status[24];
+    char certificate_url[ACME_URL_MAX_LENGTH];
+} acme_certificate_issue_status_t;
+
 esp_err_t acme_client_probe_staging(acme_directory_status_t *out_status);
 
 /* Read local account identity state. Does not contact Let's Encrypt. */
@@ -74,6 +88,10 @@ esp_err_t acme_client_discover_staging_order(const char *hostname,
 /* Trigger a discovered staging DNS-01 challenge and poll its authorization. */
 esp_err_t acme_client_validate_staging_dns01(const acme_order_discovery_t *order,
                                              acme_challenge_validation_t *out_status);
+
+/* Finalize an already validated staging order, retrieve and securely store its certificate/key. */
+esp_err_t acme_client_finalize_staging_order(const acme_order_discovery_t *order,
+                                             acme_certificate_issue_status_t *out_status);
 
 #ifdef __cplusplus
 }
