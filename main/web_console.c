@@ -9,6 +9,7 @@
 #include "app_config.h"
 #include "app_state.h"
 #include "clock_discipline.h"
+#include "device_config.h"
 #include "eth_service.h"
 #include "gnss_service.h"
 #include "ntp_server.h"
@@ -26,6 +27,7 @@ static const char *TAG = "WEB";
 #define APP_WEB_CONSOLE_PORT                    443U
 #define APP_WEB_CONSOLE_STACK_SIZE              8192U
 #define APP_WEB_CONSOLE_MAX_HANDLERS            8U
+#define APP_WEB_CONFIG_BODY_MAX                  160U
 #define APP_WEB_CONSOLE_MAX_OPEN_SOCKETS        4U
 
 static httpd_handle_t s_server;
@@ -33,6 +35,8 @@ static bool s_started;
 
 extern const unsigned char servercert_pem_start[] asm("_binary_servercert_pem_start");
 extern const unsigned char servercert_pem_end[] asm("_binary_servercert_pem_end");
+extern const unsigned char management_ca_pem_start[] asm("_binary_management_ca_pem_start");
+extern const unsigned char management_ca_pem_end[] asm("_binary_management_ca_pem_end");
 extern const unsigned char serverkey_pem_start[] asm("_binary_serverkey_pem_start");
 extern const unsigned char serverkey_pem_end[] asm("_binary_serverkey_pem_end");
 
@@ -166,7 +170,7 @@ static esp_err_t send_status_json(httpd_req_t *request)
         sizeof(response),
         "{"
         "\"console\":{"
-        "\"mode\":\"read_only_https\","
+        "\"mode\":\"mtls_authenticated\","
         "\"port\":%u"
         "},"
         "\"readiness\":{"
@@ -456,6 +460,140 @@ static esp_err_t send_metrics_response(httpd_req_t *request)
                            HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t send_config_json(httpd_req_t *request)
+{
+    device_config_snapshot_t config;
+    esp_err_t err = device_config_get_snapshot(&config);
+
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(request,
+                                   HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "configuration unavailable");
+    }
+
+    char response[192];
+    const int length = snprintf(response,
+                                sizeof(response),
+                                "{\"schema_version\":%" PRIu32
+                                ",\"generation\":%" PRIu32
+                                ",\"hostname\":\"%s\"}\n",
+                                config.schema_version,
+                                config.generation,
+                                config.hostname);
+
+    if (length < 0 || length >= (int)sizeof(response)) {
+        return httpd_resp_send_err(request,
+                                   HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "configuration serialization failed");
+    }
+
+    httpd_resp_set_type(request, "application/json");
+    set_security_headers(request);
+    return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+}
+
+static bool parse_hostname_json(const char *body,
+                                char *hostname,
+                                size_t hostname_size)
+{
+    if (body == NULL || hostname == NULL || hostname_size == 0U) {
+        return false;
+    }
+
+    const char *key = strstr(body, "\"hostname\"");
+    if (key == NULL) {
+        return false;
+    }
+
+    const char *p = key + strlen("\"hostname\"");
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+        ++p;
+    }
+    if (*p++ != ':') {
+        return false;
+    }
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+        ++p;
+    }
+    if (*p++ != '"') {
+        return false;
+    }
+
+    size_t n = 0U;
+    while (*p != '\0' && *p != '"') {
+        /* Hostnames never require JSON escapes; reject them explicitly. */
+        if (*p == '\\' || n + 1U >= hostname_size) {
+            return false;
+        }
+        hostname[n++] = *p++;
+    }
+
+    if (*p != '"' || n == 0U) {
+        return false;
+    }
+
+    hostname[n] = '\0';
+    return device_config_hostname_is_valid(hostname);
+}
+
+static esp_err_t config_get_handler(httpd_req_t *request)
+{
+    return send_config_json(request);
+}
+
+static esp_err_t hostname_put_handler(httpd_req_t *request)
+{
+    if (request->content_len <= 0 ||
+        request->content_len >= APP_WEB_CONFIG_BODY_MAX) {
+        return httpd_resp_send_err(request,
+                                   HTTPD_400_BAD_REQUEST,
+                                   "invalid request body");
+    }
+
+    char body[APP_WEB_CONFIG_BODY_MAX];
+    size_t received = 0U;
+
+    while (received < (size_t)request->content_len) {
+        const int result = httpd_req_recv(request,
+                                          body + received,
+                                          (size_t)request->content_len - received);
+        if (result == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (result <= 0) {
+            return httpd_resp_send_err(request,
+                                       HTTPD_400_BAD_REQUEST,
+                                       "request body receive failed");
+        }
+        received += (size_t)result;
+    }
+    body[received] = '\0';
+
+    char hostname[APP_DEVICE_HOSTNAME_MAX_LENGTH + 1U];
+    if (!parse_hostname_json(body, hostname, sizeof(hostname))) {
+        return httpd_resp_send_err(request,
+                                   HTTPD_400_BAD_REQUEST,
+                                   "expected valid JSON hostname");
+    }
+
+    const esp_err_t err = device_config_set_hostname(hostname);
+    if (err == ESP_ERR_INVALID_ARG) {
+        return httpd_resp_send_err(request,
+                                   HTTPD_400_BAD_REQUEST,
+                                   "invalid hostname");
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Authenticated hostname update failed: %s",
+                 esp_err_to_name(err));
+        return httpd_resp_send_err(request,
+                                   HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "configuration commit failed");
+    }
+
+    ESP_LOGI(TAG, "Authenticated hostname update accepted");
+    return send_config_json(request);
+}
+
 static esp_err_t index_handler(httpd_req_t *request)
 {
     static const char html[] =
@@ -497,14 +635,15 @@ static esp_err_t index_handler(httpd_req_t *request)
         "<body>"
         "<header>"
         "<h1>ESP32-P4 GNSS NTP Server</h1>"
-        "<p>Read-only HTTPS operational console &middot; automatic refresh every three seconds</p>"
+        "<p>mTLS-authenticated HTTPS operational console &middot; automatic refresh every three seconds</p>"
         "</header>"
         "<main>"
         "<div class=\"summary\" id=\"summary\"></div>"
         "<div class=\"grid\" id=\"cards\"></div>"
         "<footer>"
-        "Read-only HTTPS endpoints: <code>/api/v1/status</code> &middot; "
-        "<code>/api/v1/health</code> &middot; <code>/metrics</code>"
+        "mTLS management endpoints: <code>/api/v1/status</code> &middot; "
+        "<code>/api/v1/health</code> &middot; <code>/metrics</code> &middot; "
+        "<code>GET /api/v1/config</code> &middot; <code>PUT /api/v1/config/hostname</code>"
         "</footer>"
         "</main>"
         "<script>"
@@ -647,6 +786,20 @@ static const httpd_uri_t s_metrics_uri = {
     .user_ctx = NULL,
 };
 
+static const httpd_uri_t s_config_get_uri = {
+    .uri = "/api/v1/config",
+    .method = HTTP_GET,
+    .handler = config_get_handler,
+    .user_ctx = NULL,
+};
+
+static const httpd_uri_t s_hostname_put_uri = {
+    .uri = "/api/v1/config/hostname",
+    .method = HTTP_PUT,
+    .handler = hostname_put_handler,
+    .user_ctx = NULL,
+};
+
 esp_err_t web_console_start(void)
 {
     if (s_started) {
@@ -665,6 +818,8 @@ esp_err_t web_console_start(void)
     config.servercert_len = (size_t)(servercert_pem_end - servercert_pem_start);
     config.prvtkey_pem = serverkey_pem_start;
     config.prvtkey_len = (size_t)(serverkey_pem_end - serverkey_pem_start);
+    config.cacert_pem = management_ca_pem_start;
+    config.cacert_len = (size_t)(management_ca_pem_end - management_ca_pem_start);
 
     esp_err_t err = httpd_ssl_start(&s_server, &config);
 
@@ -704,11 +859,27 @@ esp_err_t web_console_start(void)
         return err;
     }
 
+    err = httpd_register_uri_handler(s_server, &s_config_get_uri);
+
+    if (err != ESP_OK) {
+        (void)httpd_ssl_stop(s_server);
+        s_server = NULL;
+        return err;
+    }
+
+    err = httpd_register_uri_handler(s_server, &s_hostname_put_uri);
+
+    if (err != ESP_OK) {
+        (void)httpd_ssl_stop(s_server);
+        s_server = NULL;
+        return err;
+    }
+
     s_started = true;
 
     ESP_LOGW(TAG,
-             "Read-only HTTPS console active on TCP/%u; "
-             "restrict access to a trusted management network",
+             "mTLS management console active on TCP/%u; "
+             "client certificate required",
              APP_WEB_CONSOLE_PORT);
 
     return ESP_OK;

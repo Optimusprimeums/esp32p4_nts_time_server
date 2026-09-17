@@ -28,8 +28,8 @@ esp_err_t device_config_get_snapshot(device_config_snapshot_t *out_snapshot);
 esp_err_t device_config_get_hostname(char *buffer, size_t buffer_size);
 
 /*
- * Persistent mutation API reserved for a future authenticated management
- * endpoint. Phase 5B.2 does not expose this function over HTTP.
+ * Persistent mutation API used by the mTLS-authenticated management
+ * endpoint introduced in Phase 5B.5.
  *
  * A new value is validated, normalized, committed to NVS, and only then
  * published to the runtime state.

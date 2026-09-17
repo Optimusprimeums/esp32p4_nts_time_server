@@ -36,4 +36,5 @@ idf_component_register(
     EMBED_TXTFILES
         "servercert.pem"
         "serverkey.pem"
+        "management_ca.pem"
 )
