@@ -2480,3 +2480,161 @@ esp_err_t acme_client_finalize_production_order(const acme_order_discovery_t *or
     context->type=ACME_WORK_FINALIZE_ORDER; context->production=true; context->order=*order;
     esp_err_t result=run_worker(context); *out_status=context->certificate; memset(context,0,sizeof(*context)); free(context); return result;
 }
+
+
+
+esp_err_t acme_client_run_production_certificate_transaction(
+    const char *hostname,
+    const acme_production_dns01_hooks_t *dns01_hooks,
+    acme_production_transaction_status_t *out_status)
+{
+    if (hostname == NULL || dns01_hooks == NULL || out_status == NULL ||
+        dns01_hooks->prepare_dns01 == NULL || dns01_hooks->cleanup_dns01 == NULL ||
+        !dns_name_is_valid(hostname)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(out_status, 0, sizeof(*out_status));
+    out_status->stage = ACME_PRODUCTION_TRANSACTION_STAGE_ACCOUNT;
+    out_status->primary_result = ESP_FAIL;
+    out_status->cleanup_result = ESP_OK;
+
+    esp_err_t err = acme_client_provision_production_account(&out_status->account);
+    if (err != ESP_OK) {
+        out_status->primary_result = err;
+        return err;
+    }
+
+    out_status->stage = ACME_PRODUCTION_TRANSACTION_STAGE_ORDER;
+    err = acme_client_discover_production_order(hostname, &out_status->order);
+    if (err != ESP_OK) {
+        out_status->primary_result = err;
+        return err;
+    }
+
+    out_status->stage = ACME_PRODUCTION_TRANSACTION_STAGE_DNS01_PREPARE;
+    err = dns01_hooks->prepare_dns01(&out_status->order, dns01_hooks->context);
+    if (err != ESP_OK) {
+        out_status->primary_result = err;
+        return err;
+    }
+    out_status->dns01_prepared = true;
+
+    out_status->stage = ACME_PRODUCTION_TRANSACTION_STAGE_CHALLENGE;
+    err = acme_client_validate_production_dns01(&out_status->order,
+                                                &out_status->validation);
+    if (err == ESP_OK && !out_status->validation.valid) {
+        err = ESP_ERR_INVALID_RESPONSE;
+    }
+
+    if (err == ESP_OK) {
+        out_status->stage = ACME_PRODUCTION_TRANSACTION_STAGE_FINALIZE;
+        err = acme_client_finalize_production_order(&out_status->order,
+                                                    &out_status->certificate);
+        if (err == ESP_OK && (!out_status->certificate.finalized ||
+                              !out_status->certificate.certificate_retrieved ||
+                              !out_status->certificate.stored)) {
+            err = ESP_ERR_INVALID_RESPONSE;
+        }
+    }
+
+    out_status->primary_result = err;
+
+    /*
+     * DNS cleanup is mandatory once prepare_dns01 succeeded. Preserve the ACME
+     * failure as the primary result; if ACME succeeded but cleanup failed,
+     * surface the cleanup failure so callers cannot mistake residue for success.
+     */
+    out_status->stage = ACME_PRODUCTION_TRANSACTION_STAGE_DNS01_CLEANUP;
+    out_status->cleanup_attempted = true;
+    out_status->cleanup_result = dns01_hooks->cleanup_dns01(&out_status->order,
+                                                            dns01_hooks->context);
+    if (err == ESP_OK && out_status->cleanup_result != ESP_OK) {
+        return out_status->cleanup_result;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    out_status->stage = ACME_PRODUCTION_TRANSACTION_STAGE_COMPLETE;
+    out_status->completed = true;
+    out_status->primary_result = ESP_OK;
+    return ESP_OK;
+}
+
+esp_err_t acme_client_get_automatic_renewal_enabled(bool *out_enabled)
+{
+    if (out_enabled == NULL) return ESP_ERR_INVALID_ARG;
+    *out_enabled = false;
+    esp_err_t err = acme_storage_init();
+    if (err != ESP_OK) return err;
+    nvs_handle_t handle;
+    err = nvs_open_from_partition("nvs_certs", "acme", NVS_READONLY, &handle);
+    if (err != ESP_OK) return err;
+    uint8_t value = 0U;
+    err = nvs_get_u8(handle, "renew_auto", &value);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    if (err != ESP_OK) return err;
+    if (value > 1U) return ESP_ERR_INVALID_STATE;
+    *out_enabled = value != 0U;
+    return ESP_OK;
+}
+
+esp_err_t acme_client_set_automatic_renewal_enabled(bool enabled)
+{
+    esp_err_t err = acme_storage_init();
+    if (err != ESP_OK) return err;
+    nvs_handle_t handle;
+    err = nvs_open_from_partition("nvs_certs", "acme", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(handle, "renew_auto", enabled ? 1U : 0U);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return err;
+}
+
+esp_err_t acme_client_load_renewal_attempt_record(acme_renewal_attempt_record_t *out_record)
+{
+    if (out_record == NULL) return ESP_ERR_INVALID_ARG;
+    memset(out_record, 0, sizeof(*out_record));
+    out_record->version = ACME_RENEWAL_ATTEMPT_RECORD_VERSION;
+    esp_err_t err = acme_storage_init();
+    if (err != ESP_OK) return err;
+    nvs_handle_t handle;
+    err = nvs_open_from_partition("nvs_certs", "acme", NVS_READONLY, &handle);
+    if (err != ESP_OK) return err;
+    size_t length = sizeof(*out_record);
+    err = nvs_get_blob(handle, "renew_att", out_record, &length);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        memset(out_record, 0, sizeof(*out_record));
+        out_record->version = ACME_RENEWAL_ATTEMPT_RECORD_VERSION;
+        return ESP_OK;
+    }
+    if (err != ESP_OK) return err;
+    if (length != sizeof(*out_record) ||
+        out_record->version != ACME_RENEWAL_ATTEMPT_RECORD_VERSION) {
+        return ESP_ERR_INVALID_VERSION;
+    }
+    if (out_record->last_transaction_stage > ACME_PRODUCTION_TRANSACTION_STAGE_COMPLETE)
+        return ESP_ERR_INVALID_STATE;
+    return ESP_OK;
+}
+
+esp_err_t acme_client_store_renewal_attempt_record(const acme_renewal_attempt_record_t *record)
+{
+    if (record == NULL || record->version != ACME_RENEWAL_ATTEMPT_RECORD_VERSION)
+        return ESP_ERR_INVALID_ARG;
+    if (record->last_transaction_stage > ACME_PRODUCTION_TRANSACTION_STAGE_COMPLETE)
+        return ESP_ERR_INVALID_ARG;
+    esp_err_t err = acme_storage_init();
+    if (err != ESP_OK) return err;
+    nvs_handle_t handle;
+    err = nvs_open_from_partition("nvs_certs", "acme", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_blob(handle, "renew_att", record, sizeof(*record));
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return err;
+}

@@ -138,6 +138,10 @@ void acme_client_free_tls_credentials(acme_tls_credentials_t *credentials);
 /* Persisted boot TLS selection. Only production may be selected persistently. */
 esp_err_t acme_client_get_production_boot_selected(bool *out_selected);
 esp_err_t acme_client_set_production_boot_selected(bool selected);
+
+/* Persistent unattended-renewal policy switch. Defaults disabled when absent. */
+esp_err_t acme_client_get_automatic_renewal_enabled(bool *out_enabled);
+esp_err_t acme_client_set_automatic_renewal_enabled(bool enabled);
 /* Prepare/migrate the production credential store. ESP_ERR_NOT_FOUND means no production credential exists. */
 esp_err_t acme_client_prepare_production_storage(void);
 
@@ -154,6 +158,87 @@ esp_err_t acme_client_provision_production_account(acme_account_status_t *out_st
 esp_err_t acme_client_discover_production_order(const char *hostname, acme_order_discovery_t *out_status);
 esp_err_t acme_client_validate_production_dns01(const acme_order_discovery_t *order, acme_challenge_validation_t *out_status);
 esp_err_t acme_client_finalize_production_order(const acme_order_discovery_t *order, acme_certificate_issue_status_t *out_status);
+
+
+/*
+ * Phase 5B.10e.1 reusable production certificate transaction core.
+ *
+ * This API is deliberately inert until a caller invokes it. It does not alter
+ * the persisted automatic-renewal policy and it never activates TLS credentials.
+ * DNS-01 publication remains owned by the caller through the hooks below so the
+ * ACME client does not acquire Cloudflare credentials or provider-specific logic.
+ * prepare_dns01 must publish, verify, and perform any required propagation wait
+ * before returning ESP_OK. cleanup_dns01 is attempted on every path after a
+ * successful prepare_dns01 call, including ACME validation/finalization failure.
+ */
+typedef esp_err_t (*acme_production_dns01_prepare_fn)(
+    const acme_order_discovery_t *order,
+    void *context);
+
+typedef esp_err_t (*acme_production_dns01_cleanup_fn)(
+    const acme_order_discovery_t *order,
+    void *context);
+
+typedef struct {
+    acme_production_dns01_prepare_fn prepare_dns01;
+    acme_production_dns01_cleanup_fn cleanup_dns01;
+    void *context;
+} acme_production_dns01_hooks_t;
+
+typedef enum {
+    ACME_PRODUCTION_TRANSACTION_STAGE_NONE = 0,
+    ACME_PRODUCTION_TRANSACTION_STAGE_ACCOUNT,
+    ACME_PRODUCTION_TRANSACTION_STAGE_ORDER,
+    ACME_PRODUCTION_TRANSACTION_STAGE_DNS01_PREPARE,
+    ACME_PRODUCTION_TRANSACTION_STAGE_CHALLENGE,
+    ACME_PRODUCTION_TRANSACTION_STAGE_FINALIZE,
+    ACME_PRODUCTION_TRANSACTION_STAGE_DNS01_CLEANUP,
+    ACME_PRODUCTION_TRANSACTION_STAGE_COMPLETE,
+} acme_production_transaction_stage_t;
+
+typedef struct {
+    acme_production_transaction_stage_t stage;
+    esp_err_t primary_result;
+    esp_err_t cleanup_result;
+    bool dns01_prepared;
+    bool cleanup_attempted;
+    bool completed;
+    acme_account_status_t account;
+    acme_order_discovery_t order;
+    acme_challenge_validation_t validation;
+    acme_certificate_issue_status_t certificate;
+} acme_production_transaction_status_t;
+
+#define ACME_RENEWAL_ATTEMPT_RECORD_VERSION 1U
+typedef struct {
+    uint32_t version;
+    uint32_t attempt_count;
+    int64_t last_attempt_unix;
+    int64_t retry_not_before_unix;
+    bool attempt_was_in_progress;
+    bool last_attempt_result_valid;
+    esp_err_t last_attempt_result;
+    acme_production_transaction_stage_t last_transaction_stage;
+    bool last_transaction_completed;
+    bool last_dns01_prepared;
+    bool last_cleanup_attempted;
+    esp_err_t last_cleanup_result;
+} acme_renewal_attempt_record_t;
+
+esp_err_t acme_client_load_renewal_attempt_record(acme_renewal_attempt_record_t *out_record);
+esp_err_t acme_client_store_renewal_attempt_record(const acme_renewal_attempt_record_t *record);
+
+/*
+ * Run one complete production issuance/replacement transaction using the
+ * existing protected account identity and dual-slot production store.
+ * Successful finalization stores the new credential atomically through the
+ * existing production storage path, but does NOT activate it for management TLS.
+ * No scheduler or HTTP endpoint calls this function in 5B.10e.1.
+ */
+esp_err_t acme_client_run_production_certificate_transaction(
+    const char *hostname,
+    const acme_production_dns01_hooks_t *dns01_hooks,
+    acme_production_transaction_status_t *out_status);
 
 #ifdef __cplusplus
 }

@@ -34,6 +34,11 @@ static const char *TAG = "WEB";
 #define APP_WEB_CONSOLE_MAX_HANDLERS            30U
 #define APP_WEB_CONFIG_BODY_MAX                  1024U
 #define APP_WEB_CONSOLE_MAX_OPEN_SOCKETS        4U
+#define APP_ACME_RENEWAL_CHECK_INTERVAL_MS       (6U * 60U * 60U * 1000U)
+#define APP_ACME_RENEWAL_INITIAL_DELAY_MS         30000U
+#define APP_ACME_RENEWAL_TASK_STACK_SIZE          8192U
+#define APP_ACME_RENEWAL_TASK_PRIORITY               4U
+#define APP_ACME_RENEWAL_ATTEMPT_COOLDOWN_SECONDS   (6LL * 60LL * 60LL)
 
 static httpd_handle_t s_server;
 static bool s_started;
@@ -48,8 +53,50 @@ static volatile bool s_tls_transition_pending;
 static web_tls_source_t s_tls_source = WEB_TLS_EMBEDDED;
 static acme_tls_credentials_t s_active_stored_credentials;
 
+typedef enum {
+    ACME_RENEWAL_SCHEDULER_NOT_EVALUATED = 0,
+    ACME_RENEWAL_SCHEDULER_NO_CERTIFICATE,
+    ACME_RENEWAL_SCHEDULER_TIME_UNAVAILABLE,
+    ACME_RENEWAL_SCHEDULER_INVALID_CERTIFICATE,
+    ACME_RENEWAL_SCHEDULER_VALID,
+    ACME_RENEWAL_SCHEDULER_DUE,
+    ACME_RENEWAL_SCHEDULER_URGENT,
+    ACME_RENEWAL_SCHEDULER_EXPIRED,
+} acme_renewal_scheduler_state_t;
+
+typedef struct {
+    bool task_started;
+    bool evaluated;
+    uint32_t evaluation_count;
+    int64_t last_evaluation_unix;
+    int64_t seconds_remaining;
+    int64_t days_remaining;
+    acme_renewal_scheduler_state_t state;
+    bool automatic_renewal_enabled;
+    bool eligible;
+    bool execution_preflight_ready;
+    bool attempt_in_progress;
+    uint32_t attempt_count;
+    int64_t last_attempt_unix;
+    int64_t retry_not_before_unix;
+    bool last_attempt_result_valid;
+    esp_err_t last_attempt_result;
+    acme_production_transaction_stage_t last_transaction_stage;
+    bool last_transaction_completed;
+    bool last_dns01_prepared;
+    bool last_cleanup_attempted;
+    esp_err_t last_cleanup_result;
+    bool attempt_state_loaded;
+    bool recovered_interrupted_attempt;
+} acme_renewal_scheduler_status_t;
+
+static portMUX_TYPE s_renewal_scheduler_lock = portMUX_INITIALIZER_UNLOCKED;
+static acme_renewal_scheduler_status_t s_renewal_scheduler_status;
+static TaskHandle_t s_renewal_scheduler_task;
+
 static esp_err_t start_https_server(web_tls_source_t source);
 static void tls_transition_task(void *arg);
+static bool hostname_in_zone(const char *hostname, const char *zone);
 
 static const char *tls_source_name(web_tls_source_t source)
 {
@@ -159,6 +206,534 @@ static bool parse_utc_timestamp(const char *text, int64_t *out_unix)
     const int64_t days = (int64_t)era * 146097LL + (int64_t)doe - 719468LL;
     *out_unix = days * 86400LL + (int64_t)h * 3600LL + (int64_t)mi * 60LL + sec;
     return true;
+}
+
+static const char *renewal_scheduler_state_name(acme_renewal_scheduler_state_t state)
+{
+    switch (state) {
+    case ACME_RENEWAL_SCHEDULER_NO_CERTIFICATE: return "no_certificate";
+    case ACME_RENEWAL_SCHEDULER_TIME_UNAVAILABLE: return "time_unavailable";
+    case ACME_RENEWAL_SCHEDULER_INVALID_CERTIFICATE: return "invalid_certificate";
+    case ACME_RENEWAL_SCHEDULER_VALID: return "valid";
+    case ACME_RENEWAL_SCHEDULER_DUE: return "renewal_due";
+    case ACME_RENEWAL_SCHEDULER_URGENT: return "urgent";
+    case ACME_RENEWAL_SCHEDULER_EXPIRED: return "expired";
+    default: return "not_evaluated";
+    }
+}
+
+
+static const char *renewal_transaction_stage_to_string(acme_production_transaction_stage_t stage)
+{
+    switch (stage) {
+        case ACME_PRODUCTION_TRANSACTION_STAGE_NONE: return "none";
+        case ACME_PRODUCTION_TRANSACTION_STAGE_ACCOUNT: return "account";
+        case ACME_PRODUCTION_TRANSACTION_STAGE_ORDER: return "order";
+        case ACME_PRODUCTION_TRANSACTION_STAGE_DNS01_PREPARE: return "dns01_prepare";
+        case ACME_PRODUCTION_TRANSACTION_STAGE_CHALLENGE: return "challenge";
+        case ACME_PRODUCTION_TRANSACTION_STAGE_FINALIZE: return "finalize";
+        case ACME_PRODUCTION_TRANSACTION_STAGE_DNS01_CLEANUP: return "dns01_cleanup";
+        case ACME_PRODUCTION_TRANSACTION_STAGE_COMPLETE: return "complete";
+        default: return "unknown";
+    }
+}
+
+typedef struct {
+    device_config_cloudflare_credentials_t credentials;
+    char record_id[CLOUDFLARE_DNS_RECORD_ID_LENGTH + 1U];
+    bool record_created;
+} renewal_dns01_context_t;
+
+static esp_err_t renewal_dns01_prepare(const acme_order_discovery_t *order, void *context)
+{
+    if (order == NULL || context == NULL) return ESP_ERR_INVALID_ARG;
+    renewal_dns01_context_t *dns = (renewal_dns01_context_t *)context;
+    int create_http_status = 0;
+    int verify_http_status = 0;
+
+    esp_err_t err = cloudflare_client_create_dns01_txt(
+        dns->credentials.api_token, dns->credentials.zone_id,
+        order->dns01_record_name, order->dns01_value,
+        dns->record_id, sizeof(dns->record_id), &create_http_status);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Automatic renewal DNS-01 create failed: %s http=%d",
+                 esp_err_to_name(err), create_http_status);
+        return err;
+    }
+    dns->record_created = true;
+
+    err = cloudflare_client_verify_dns01_txt_content(
+        dns->credentials.api_token, dns->credentials.zone_id,
+        dns->record_id, order->dns01_record_name, order->dns01_value,
+        &verify_http_status);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Automatic renewal DNS-01 exact-content verify failed: %s http=%d",
+                 esp_err_to_name(err), verify_http_status);
+
+        /* The transaction core only invokes cleanup after a successful prepare.
+         * Therefore a partial prepare must remove its own record before failing. */
+        int delete_http_status = 0;
+        const esp_err_t delete_err = cloudflare_client_delete_dns01_txt(
+            dns->credentials.api_token, dns->credentials.zone_id,
+            dns->record_id, order->dns01_record_name, &delete_http_status);
+        if (delete_err == ESP_OK) {
+            dns->record_created = false;
+            memset(dns->record_id, 0, sizeof(dns->record_id));
+        } else {
+            ESP_LOGE(TAG, "Automatic renewal partial DNS-01 cleanup failed: %s http=%d",
+                     esp_err_to_name(delete_err), delete_http_status);
+        }
+        return err;
+    }
+
+    /* Preserve the already-validated Phase 5B DNS-01 propagation delay. */
+    vTaskDelay(pdMS_TO_TICKS(10000));
+    return ESP_OK;
+}
+
+static esp_err_t renewal_dns01_cleanup(const acme_order_discovery_t *order, void *context)
+{
+    if (order == NULL || context == NULL) return ESP_ERR_INVALID_ARG;
+    renewal_dns01_context_t *dns = (renewal_dns01_context_t *)context;
+    if (!dns->record_created) return ESP_OK;
+
+    int delete_http_status = 0;
+    const esp_err_t err = cloudflare_client_delete_dns01_txt(
+        dns->credentials.api_token, dns->credentials.zone_id,
+        dns->record_id, order->dns01_record_name, &delete_http_status);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Automatic renewal DNS-01 cleanup failed: %s http=%d",
+                 esp_err_to_name(err), delete_http_status);
+        return err;
+    }
+
+    dns->record_created = false;
+    memset(dns->record_id, 0, sizeof(dns->record_id));
+    return ESP_OK;
+}
+
+static esp_err_t renewal_scheduler_persist_attempt_state(bool attempt_was_in_progress)
+{
+    acme_renewal_attempt_record_t record;
+    memset(&record, 0, sizeof(record));
+    record.version = ACME_RENEWAL_ATTEMPT_RECORD_VERSION;
+    portENTER_CRITICAL(&s_renewal_scheduler_lock);
+    record.attempt_count = s_renewal_scheduler_status.attempt_count;
+    record.last_attempt_unix = s_renewal_scheduler_status.last_attempt_unix;
+    record.retry_not_before_unix = s_renewal_scheduler_status.retry_not_before_unix;
+    record.attempt_was_in_progress = attempt_was_in_progress;
+    record.last_attempt_result_valid = s_renewal_scheduler_status.last_attempt_result_valid;
+    record.last_attempt_result = s_renewal_scheduler_status.last_attempt_result;
+    record.last_transaction_stage = s_renewal_scheduler_status.last_transaction_stage;
+    record.last_transaction_completed = s_renewal_scheduler_status.last_transaction_completed;
+    record.last_dns01_prepared = s_renewal_scheduler_status.last_dns01_prepared;
+    record.last_cleanup_attempted = s_renewal_scheduler_status.last_cleanup_attempted;
+    record.last_cleanup_result = s_renewal_scheduler_status.last_cleanup_result;
+    portEXIT_CRITICAL(&s_renewal_scheduler_lock);
+    return acme_client_store_renewal_attempt_record(&record);
+}
+
+static esp_err_t renewal_scheduler_load_attempt_state(void)
+{
+    acme_renewal_attempt_record_t record;
+    const esp_err_t err = acme_client_load_renewal_attempt_record(&record);
+    if (err != ESP_OK) return err;
+    portENTER_CRITICAL(&s_renewal_scheduler_lock);
+    s_renewal_scheduler_status.attempt_count = record.attempt_count;
+    s_renewal_scheduler_status.last_attempt_unix = record.last_attempt_unix;
+    s_renewal_scheduler_status.retry_not_before_unix = record.retry_not_before_unix;
+    s_renewal_scheduler_status.last_attempt_result_valid = record.last_attempt_result_valid;
+    s_renewal_scheduler_status.last_attempt_result = record.last_attempt_result;
+    s_renewal_scheduler_status.last_transaction_stage = record.last_transaction_stage;
+    s_renewal_scheduler_status.last_transaction_completed = record.last_transaction_completed;
+    s_renewal_scheduler_status.last_dns01_prepared = record.last_dns01_prepared;
+    s_renewal_scheduler_status.last_cleanup_attempted = record.last_cleanup_attempted;
+    s_renewal_scheduler_status.last_cleanup_result = record.last_cleanup_result;
+    s_renewal_scheduler_status.attempt_in_progress = false;
+    s_renewal_scheduler_status.attempt_state_loaded = true;
+    s_renewal_scheduler_status.recovered_interrupted_attempt = record.attempt_was_in_progress;
+    portEXIT_CRITICAL(&s_renewal_scheduler_lock);
+    if (record.attempt_was_in_progress)
+        ESP_LOGW(TAG, "Recovered interrupted automatic renewal attempt; persisted cooldown retained");
+    return ESP_OK;
+}
+
+static void renewal_scheduler_execute_if_ready(void)
+{
+    acme_renewal_scheduler_status_t snapshot;
+    int64_t now = 0;
+
+    portENTER_CRITICAL(&s_renewal_scheduler_lock);
+    snapshot = s_renewal_scheduler_status;
+    portEXIT_CRITICAL(&s_renewal_scheduler_lock);
+
+    if (!snapshot.execution_preflight_ready || !snapshot.eligible ||
+        snapshot.attempt_in_progress) {
+        return;
+    }
+    if (!get_current_unix_time(&now) || now <= 0) {
+        ESP_LOGW(TAG, "Automatic renewal execution skipped: disciplined time unavailable");
+        return;
+    }
+
+    /* Atomically consume the preflight gate and acquire the attempt lock. */
+    portENTER_CRITICAL(&s_renewal_scheduler_lock);
+    if (!s_renewal_scheduler_status.execution_preflight_ready ||
+        s_renewal_scheduler_status.attempt_in_progress ||
+        (s_renewal_scheduler_status.retry_not_before_unix > 0 &&
+         now < s_renewal_scheduler_status.retry_not_before_unix)) {
+        portEXIT_CRITICAL(&s_renewal_scheduler_lock);
+        return;
+    }
+    s_renewal_scheduler_status.attempt_in_progress = true;
+    s_renewal_scheduler_status.execution_preflight_ready = false;
+    s_renewal_scheduler_status.attempt_count++;
+    s_renewal_scheduler_status.last_attempt_unix = now;
+    s_renewal_scheduler_status.retry_not_before_unix =
+        now + APP_ACME_RENEWAL_ATTEMPT_COOLDOWN_SECONDS;
+    s_renewal_scheduler_status.last_attempt_result_valid = false;
+    s_renewal_scheduler_status.last_attempt_result = ESP_OK;
+    s_renewal_scheduler_status.last_transaction_stage = ACME_PRODUCTION_TRANSACTION_STAGE_NONE;
+    s_renewal_scheduler_status.last_transaction_completed = false;
+    s_renewal_scheduler_status.last_dns01_prepared = false;
+    s_renewal_scheduler_status.last_cleanup_attempted = false;
+    s_renewal_scheduler_status.last_cleanup_result = ESP_OK;
+    portEXIT_CRITICAL(&s_renewal_scheduler_lock);
+
+    esp_err_t persist_err = renewal_scheduler_persist_attempt_state(true);
+    if (persist_err != ESP_OK) {
+        ESP_LOGE(TAG, "Automatic renewal attempt-state commit failed: %s; refusing ACME execution",
+                 esp_err_to_name(persist_err));
+        portENTER_CRITICAL(&s_renewal_scheduler_lock);
+        s_renewal_scheduler_status.attempt_in_progress = false;
+        s_renewal_scheduler_status.execution_preflight_ready = false;
+        portEXIT_CRITICAL(&s_renewal_scheduler_lock);
+        return;
+    }
+
+    esp_err_t result = ESP_FAIL;
+    acme_production_transaction_status_t transaction;
+    memset(&transaction, 0, sizeof(transaction));
+    acme_certificate_inspection_t certificate;
+    memset(&certificate, 0, sizeof(certificate));
+
+    result = acme_client_inspect_stored_production_certificate(&certificate);
+    if (result != ESP_OK || !certificate.certificate_parse_valid ||
+        !certificate.hostname_matches_certificate ||
+        !certificate.private_key_matches_certificate ||
+        certificate.hostname[0] == '\0') {
+        ESP_LOGE(TAG, "Automatic renewal aborted: production credential inspection failed: %s",
+                 esp_err_to_name(result));
+        if (result == ESP_OK) result = ESP_ERR_INVALID_STATE;
+        goto complete;
+    }
+
+    device_config_snapshot_t config;
+    result = device_config_get_snapshot(&config);
+    if (result != ESP_OK || !config.cloudflare_configured ||
+        !hostname_in_zone(certificate.hostname, config.cloudflare_zone_name)) {
+        ESP_LOGE(TAG, "Automatic renewal aborted: Cloudflare configuration/zone preflight failed");
+        if (result == ESP_OK) result = ESP_ERR_INVALID_STATE;
+        goto complete;
+    }
+
+    renewal_dns01_context_t dns;
+    memset(&dns, 0, sizeof(dns));
+    result = device_config_get_cloudflare_credentials(&dns.credentials);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Automatic renewal aborted: Cloudflare credentials unavailable: %s",
+                 esp_err_to_name(result));
+        goto clear_dns_context;
+    }
+
+    acme_production_dns01_hooks_t hooks = {
+        .prepare_dns01 = renewal_dns01_prepare,
+        .cleanup_dns01 = renewal_dns01_cleanup,
+        .context = &dns,
+    };
+    ESP_LOGI(TAG, "Automatic production renewal attempt starting for %s; TLS activation disabled",
+             certificate.hostname);
+    result = acme_client_run_production_certificate_transaction(
+        certificate.hostname, &hooks, &transaction);
+
+    ESP_LOGI(TAG,
+             "Automatic production renewal attempt finished: result=%s completed=%d "
+             "dns_prepared=%d cleanup_attempted=%d cleanup_result=%s "
+             "automatic_tls_activation=false",
+             esp_err_to_name(result), transaction.completed,
+             transaction.dns01_prepared, transaction.cleanup_attempted,
+             esp_err_to_name(transaction.cleanup_result));
+
+clear_dns_context:
+    memset(dns.credentials.api_token, 0, sizeof(dns.credentials.api_token));
+    memset(&dns, 0, sizeof(dns));
+
+complete:
+    portENTER_CRITICAL(&s_renewal_scheduler_lock);
+    s_renewal_scheduler_status.attempt_in_progress = false;
+    s_renewal_scheduler_status.execution_preflight_ready = false;
+    s_renewal_scheduler_status.last_attempt_result_valid = true;
+    s_renewal_scheduler_status.last_attempt_result = result;
+    s_renewal_scheduler_status.last_transaction_stage = transaction.stage;
+    s_renewal_scheduler_status.last_transaction_completed = transaction.completed;
+    s_renewal_scheduler_status.last_dns01_prepared = transaction.dns01_prepared;
+    s_renewal_scheduler_status.last_cleanup_attempted = transaction.cleanup_attempted;
+    s_renewal_scheduler_status.last_cleanup_result = transaction.cleanup_result;
+    portEXIT_CRITICAL(&s_renewal_scheduler_lock);
+
+    persist_err = renewal_scheduler_persist_attempt_state(false);
+    if (persist_err != ESP_OK)
+        ESP_LOGE(TAG, "Automatic renewal final attempt-state commit failed: %s", esp_err_to_name(persist_err));
+
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Automatic production renewal attempt failed: %s; cooldown remains armed",
+                 esp_err_to_name(result));
+    }
+}
+
+static void renewal_scheduler_evaluate(void)
+{
+    acme_renewal_scheduler_status_t next = {0};
+    acme_certificate_inspection_t certificate;
+    int64_t now = 0;
+    int64_t expires = 0;
+
+    portENTER_CRITICAL(&s_renewal_scheduler_lock);
+    next.task_started = s_renewal_scheduler_status.task_started;
+    next.evaluation_count = s_renewal_scheduler_status.evaluation_count + 1U;
+    portEXIT_CRITICAL(&s_renewal_scheduler_lock);
+    next.evaluated = true;
+
+    const esp_err_t inspect_err =
+        acme_client_inspect_stored_production_certificate(&certificate);
+    if (inspect_err == ESP_ERR_NOT_FOUND) {
+        next.state = ACME_RENEWAL_SCHEDULER_NO_CERTIFICATE;
+    } else if (inspect_err != ESP_OK && inspect_err != ESP_ERR_INVALID_STATE) {
+        next.state = ACME_RENEWAL_SCHEDULER_INVALID_CERTIFICATE;
+    } else if (!certificate.certificate_parse_valid ||
+               !certificate.hostname_matches_certificate ||
+               !certificate.private_key_matches_certificate ||
+               !parse_utc_timestamp(certificate.valid_to, &expires)) {
+        next.state = ACME_RENEWAL_SCHEDULER_INVALID_CERTIFICATE;
+    } else if (!get_current_unix_time(&now)) {
+        next.state = ACME_RENEWAL_SCHEDULER_TIME_UNAVAILABLE;
+    } else {
+        next.last_evaluation_unix = now;
+        next.seconds_remaining = expires - now;
+        next.days_remaining = next.seconds_remaining >= 0
+                                  ? next.seconds_remaining / 86400LL
+                                  : -((-next.seconds_remaining + 86399LL) / 86400LL);
+        if (next.seconds_remaining <= 0) {
+            next.state = ACME_RENEWAL_SCHEDULER_EXPIRED;
+        } else if (next.seconds_remaining <= 7LL * 86400LL) {
+            next.state = ACME_RENEWAL_SCHEDULER_URGENT;
+        } else if (next.seconds_remaining <= 30LL * 86400LL) {
+            next.state = ACME_RENEWAL_SCHEDULER_DUE;
+        } else {
+            next.state = ACME_RENEWAL_SCHEDULER_VALID;
+        }
+    }
+
+    bool automatic_enabled = false;
+    const esp_err_t policy_err = acme_client_get_automatic_renewal_enabled(&automatic_enabled);
+    if (policy_err != ESP_OK) {
+        ESP_LOGE(TAG, "ACME renewal policy read failed: %s; forcing disabled", esp_err_to_name(policy_err));
+        automatic_enabled = false;
+    }
+    next.automatic_renewal_enabled = automatic_enabled;
+    next.eligible = automatic_enabled &&
+                    (next.state == ACME_RENEWAL_SCHEDULER_DUE ||
+                     next.state == ACME_RENEWAL_SCHEDULER_URGENT ||
+                     next.state == ACME_RENEWAL_SCHEDULER_EXPIRED);
+
+    /* Preserve execution accounting across evaluations. A genuine due/urgent/
+     * expired evaluation may be consumed by the scheduler task after this
+     * state is published. */
+    portENTER_CRITICAL(&s_renewal_scheduler_lock);
+    next.attempt_in_progress = s_renewal_scheduler_status.attempt_in_progress;
+    next.attempt_count = s_renewal_scheduler_status.attempt_count;
+    next.last_attempt_unix = s_renewal_scheduler_status.last_attempt_unix;
+    next.retry_not_before_unix = s_renewal_scheduler_status.retry_not_before_unix;
+    next.last_attempt_result_valid = s_renewal_scheduler_status.last_attempt_result_valid;
+    next.last_attempt_result = s_renewal_scheduler_status.last_attempt_result;
+    next.last_transaction_stage = s_renewal_scheduler_status.last_transaction_stage;
+    next.last_transaction_completed = s_renewal_scheduler_status.last_transaction_completed;
+    next.last_dns01_prepared = s_renewal_scheduler_status.last_dns01_prepared;
+    next.last_cleanup_attempted = s_renewal_scheduler_status.last_cleanup_attempted;
+    next.last_cleanup_result = s_renewal_scheduler_status.last_cleanup_result;
+    next.attempt_state_loaded = s_renewal_scheduler_status.attempt_state_loaded;
+    next.recovered_interrupted_attempt = s_renewal_scheduler_status.recovered_interrupted_attempt;
+    portEXIT_CRITICAL(&s_renewal_scheduler_lock);
+    const bool cooldown_clear = next.last_attempt_unix == 0 || now <= 0 ||
+                                now >= next.retry_not_before_unix;
+    next.execution_preflight_ready = next.eligible && !next.attempt_in_progress && cooldown_clear;
+
+    portENTER_CRITICAL(&s_renewal_scheduler_lock);
+    s_renewal_scheduler_status = next;
+    portEXIT_CRITICAL(&s_renewal_scheduler_lock);
+
+    ESP_LOGI(TAG, "ACME renewal scheduler evaluation: state=%s days_remaining=%" PRId64
+                  " enabled=%d eligible=%d automatic_execution=%d",
+             renewal_scheduler_state_name(next.state), next.days_remaining,
+             next.automatic_renewal_enabled, next.eligible,
+             next.execution_preflight_ready);
+}
+
+static void renewal_scheduler_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(APP_ACME_RENEWAL_INITIAL_DELAY_MS));
+    for (;;) {
+        renewal_scheduler_evaluate();
+        renewal_scheduler_execute_if_ready();
+        vTaskDelay(pdMS_TO_TICKS(APP_ACME_RENEWAL_CHECK_INTERVAL_MS));
+    }
+}
+
+static esp_err_t start_renewal_scheduler(void)
+{
+    if (s_renewal_scheduler_task != NULL) return ESP_OK;
+
+    const esp_err_t load_err = renewal_scheduler_load_attempt_state();
+    if (load_err != ESP_OK) {
+        ESP_LOGE(TAG, "Automatic renewal persisted attempt-state load failed: %s", esp_err_to_name(load_err));
+        return load_err;
+    }
+
+    portENTER_CRITICAL(&s_renewal_scheduler_lock);
+    s_renewal_scheduler_status.task_started = true;
+    portEXIT_CRITICAL(&s_renewal_scheduler_lock);
+
+    BaseType_t created = xTaskCreate(renewal_scheduler_task,
+                                     "acme_renewal",
+                                     APP_ACME_RENEWAL_TASK_STACK_SIZE,
+                                     NULL,
+                                     APP_ACME_RENEWAL_TASK_PRIORITY,
+                                     &s_renewal_scheduler_task);
+    if (created != pdPASS) {
+        portENTER_CRITICAL(&s_renewal_scheduler_lock);
+        s_renewal_scheduler_status.task_started = false;
+        portEXIT_CRITICAL(&s_renewal_scheduler_lock);
+        s_renewal_scheduler_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+static void set_security_headers(httpd_req_t *request);
+
+static const char *renewal_eligibility_reason(const acme_renewal_scheduler_status_t *status)
+{
+    if (!status->automatic_renewal_enabled) return "disabled";
+    if (!status->evaluated) return "not_evaluated";
+    switch (status->state) {
+    case ACME_RENEWAL_SCHEDULER_DUE: return "renewal_window";
+    case ACME_RENEWAL_SCHEDULER_URGENT: return "urgent_window";
+    case ACME_RENEWAL_SCHEDULER_EXPIRED: return "expired";
+    case ACME_RENEWAL_SCHEDULER_TIME_UNAVAILABLE: return "time_unavailable";
+    case ACME_RENEWAL_SCHEDULER_NO_CERTIFICATE: return "no_certificate";
+    case ACME_RENEWAL_SCHEDULER_INVALID_CERTIFICATE: return "invalid_certificate";
+    default: return "not_due";
+    }
+}
+
+static esp_err_t acme_production_renewal_scheduler_handler(httpd_req_t *request)
+{
+    acme_renewal_scheduler_status_t status;
+    portENTER_CRITICAL(&s_renewal_scheduler_lock);
+    status = s_renewal_scheduler_status;
+    portEXIT_CRITICAL(&s_renewal_scheduler_lock);
+
+    /* Refresh the persisted switch for immediate management visibility without
+     * changing the most recent certificate evaluation result. */
+    bool persisted_enabled = false;
+    if (acme_client_get_automatic_renewal_enabled(&persisted_enabled) == ESP_OK) {
+        status.automatic_renewal_enabled = persisted_enabled;
+        status.eligible = persisted_enabled && status.evaluated &&
+            (status.state == ACME_RENEWAL_SCHEDULER_DUE ||
+             status.state == ACME_RENEWAL_SCHEDULER_URGENT ||
+             status.state == ACME_RENEWAL_SCHEDULER_EXPIRED);
+    } else {
+        status.automatic_renewal_enabled = false;
+        status.eligible = false;
+    }
+
+    const int64_t next_check = status.last_evaluation_unix > 0
+                                 ? status.last_evaluation_unix + 21600LL : 0LL;
+    char response[1280];
+    const int length = snprintf(response, sizeof(response),
+        "{\"enabled\":true,\"mode\":\"automatic_execution\","
+        "\"automatic_renewal_enabled\":%s,\"automatic_certificate_replacement\":true,"
+        "\"automatic_tls_activation\":false,\"automatic_acme_execution\":true,"
+        "\"eligible\":%s,\"eligibility_reason\":\"%s\","
+        "\"execution_preflight_ready\":%s,\"attempt_in_progress\":%s,"
+        "\"attempt_count\":%" PRIu32 ",\"last_attempt_unix\":%" PRId64 ","
+        "\"retry_not_before_unix\":%" PRId64 ",\"attempt_cooldown_seconds\":21600,"
+        "\"last_attempt_result_valid\":%s,\"last_attempt_result\":\"%s\","
+        "\"last_transaction_stage\":\"%s\",\"last_transaction_completed\":%s,"
+        "\"last_dns01_prepared\":%s,\"last_cleanup_attempted\":%s,"
+        "\"last_cleanup_result\":\"%s\","
+        "\"attempt_observability_persistent\":true,""\"attempt_state_loaded\":%s,\"recovered_interrupted_attempt\":%s,"
+        "\"task_started\":%s,\"evaluated\":%s,\"evaluation_count\":%" PRIu32 ","
+        "\"check_interval_seconds\":21600,\"last_evaluation_unix\":%" PRId64 ","
+        "\"next_check_unix\":%" PRId64 ",\"state\":\"%s\","
+        "\"seconds_remaining\":%" PRId64 ",\"days_remaining\":%" PRId64 ","
+        "\"renew_before_days\":30,\"urgent_before_days\":7}\n",
+        status.automatic_renewal_enabled ? "true" : "false",
+        status.eligible ? "true" : "false", renewal_eligibility_reason(&status),
+        status.execution_preflight_ready ? "true" : "false",
+        status.attempt_in_progress ? "true" : "false", status.attempt_count,
+        status.last_attempt_unix, status.retry_not_before_unix,
+        status.last_attempt_result_valid ? "true" : "false",
+        status.last_attempt_result_valid ? esp_err_to_name(status.last_attempt_result) : "none",
+        renewal_transaction_stage_to_string(status.last_transaction_stage),
+        status.last_transaction_completed ? "true" : "false",
+        status.last_dns01_prepared ? "true" : "false",
+        status.last_cleanup_attempted ? "true" : "false",
+        status.last_cleanup_attempted ? esp_err_to_name(status.last_cleanup_result) : "none",
+        status.attempt_state_loaded ? "true" : "false",
+        status.recovered_interrupted_attempt ? "true" : "false",
+        status.task_started ? "true" : "false", status.evaluated ? "true" : "false",
+        status.evaluation_count, status.last_evaluation_unix, next_check,
+        renewal_scheduler_state_name(status.state), status.seconds_remaining, status.days_remaining);
+    if (length < 0 || length >= (int)sizeof(response))
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "serialization failed");
+    httpd_resp_set_type(request, "application/json");
+    set_security_headers(request);
+    return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t acme_production_renewal_scheduler_put_handler(httpd_req_t *request)
+{
+    if (request->content_len <= 0 || request->content_len >= 96)
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "expected {\"enabled\":true|false}");
+    char body[96]; size_t received = 0U;
+    while (received < (size_t)request->content_len) {
+        const int result = httpd_req_recv(request, body + received,
+                                          (size_t)request->content_len - received);
+        if (result == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (result <= 0) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "request body receive failed");
+        received += (size_t)result;
+    }
+    body[received] = '\0';
+    const char *key = strstr(body, "\"enabled\"");
+    if (key == NULL) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "expected enabled boolean");
+    const char *colon = strchr(key, ':');
+    if (colon == NULL) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "expected enabled boolean");
+    ++colon; while (*colon == ' ' || *colon == '\t' || *colon == '\r' || *colon == '\n') ++colon;
+    bool enabled;
+    if (strncmp(colon, "true", 4U) == 0) enabled = true;
+    else if (strncmp(colon, "false", 5U) == 0) enabled = false;
+    else return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "expected enabled boolean");
+
+    const esp_err_t err = acme_client_set_automatic_renewal_enabled(enabled);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Automatic renewal policy commit failed: %s", esp_err_to_name(err));
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "policy commit failed");
+    }
+    ESP_LOGI(TAG, "Automatic renewal policy %s; genuine due-window execution is %s; TLS auto-activation remains disabled",
+             enabled ? "armed" : "disabled", enabled ? "armed" : "disabled");
+    return acme_production_renewal_scheduler_handler(request);
 }
 
 static void set_security_headers(httpd_req_t *request)
@@ -2133,6 +2708,21 @@ static const httpd_uri_t s_acme_production_certificate_lifecycle_uri = {
     .user_ctx = NULL,
 };
 
+static const httpd_uri_t s_acme_production_renewal_scheduler_uri = {
+    .uri = "/api/v1/acme/production/renewal/scheduler",
+    .method = HTTP_GET,
+    .handler = acme_production_renewal_scheduler_handler,
+    .user_ctx = NULL,
+};
+
+static const httpd_uri_t s_acme_production_renewal_scheduler_put_uri = {
+    .uri = "/api/v1/acme/production/renewal/scheduler",
+    .method = HTTP_PUT,
+    .handler = acme_production_renewal_scheduler_put_handler,
+    .user_ctx = NULL,
+};
+
+
 static const httpd_uri_t s_acme_production_certificate_export_uri = {
     .uri = "/api/v1/acme/production/certificate/export",
     .method = HTTP_GET,
@@ -2173,6 +2763,7 @@ static esp_err_t register_all_handlers(httpd_handle_t server)
         &s_acme_production_certificate_issue_uri, &s_acme_production_certificate_renew_uri,
         &s_acme_certificate_inspection_uri,
         &s_acme_production_certificate_inspection_uri, &s_acme_production_certificate_lifecycle_uri,
+        &s_acme_production_renewal_scheduler_uri, &s_acme_production_renewal_scheduler_put_uri,
         &s_acme_production_certificate_export_uri,
         &s_acme_certificate_activate_test_uri,
         &s_acme_production_certificate_activate_uri, &s_acme_certificate_rollback_uri,
@@ -2278,7 +2869,7 @@ static void tls_transition_task(void *arg)
     vTaskDelete(NULL);
 }
 
-esp_err_t web_console_start(void)
+static esp_err_t web_console_start_https(void)
 {
     if (s_started) return ESP_OK;
     esp_err_t err = acme_client_prepare_production_storage();
@@ -2305,6 +2896,19 @@ esp_err_t web_console_start(void)
              esp_err_to_name(err));
     (void)acme_client_set_production_boot_selected(false);
     return start_https_server(WEB_TLS_EMBEDDED);
+}
+
+esp_err_t web_console_start(void)
+{
+    const esp_err_t err = web_console_start_https();
+    if (err != ESP_OK) return err;
+
+    const esp_err_t scheduler_err = start_renewal_scheduler();
+    if (scheduler_err != ESP_OK) {
+        ESP_LOGE(TAG, "ACME renewal scheduler start failed: %s", esp_err_to_name(scheduler_err));
+        /* Management HTTPS remains available; scheduler failure never changes TLS/timing/NTP state. */
+    }
+    return ESP_OK;
 }
 
 bool web_console_is_running(void)
