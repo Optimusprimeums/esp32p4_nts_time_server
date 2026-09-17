@@ -70,6 +70,23 @@ typedef struct {
     char certificate_url[ACME_URL_MAX_LENGTH];
 } acme_certificate_issue_status_t;
 
+
+
+typedef struct {
+    bool key_present;
+    bool certificate_present;
+    bool hostname_present;
+    bool certificate_parse_valid;
+    bool hostname_matches_certificate;
+    bool private_key_matches_certificate;
+    unsigned chain_certificate_count;
+    size_t certificate_pem_length;
+    char hostname[ACME_DNS_NAME_MAX_LENGTH + 1U];
+    char valid_from[32];
+    char valid_to[32];
+    char leaf_sha256[65];
+} acme_certificate_inspection_t;
+
 esp_err_t acme_client_probe_staging(acme_directory_status_t *out_status);
 
 /* Read local account identity state. Does not contact Let's Encrypt. */
@@ -92,6 +109,9 @@ esp_err_t acme_client_validate_staging_dns01(const acme_order_discovery_t *order
 /* Finalize an already validated staging order, retrieve and securely store its certificate/key. */
 esp_err_t acme_client_finalize_staging_order(const acme_order_discovery_t *order,
                                              acme_certificate_issue_status_t *out_status);
+
+/* Inspect protected stored certificate material without exposing the private key or PEM. */
+esp_err_t acme_client_inspect_stored_certificate(acme_certificate_inspection_t *out_status);
 
 #ifdef __cplusplus
 }

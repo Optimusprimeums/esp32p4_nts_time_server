@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 #include "nvs.h"
 #include "psa/crypto.h"
+#include "mbedtls/x509_crt.h"
 
 static const char *TAG = "ACME";
 
@@ -1361,6 +1362,144 @@ static esp_err_t store_certificate_material(const char *hostname,
     if (err == ESP_OK) err = nvs_set_str(handle, ACME_CERT_HOST_NVS_KEY, hostname);
     if (err == ESP_OK) err = nvs_commit(handle);
     nvs_close(handle);
+    return err;
+}
+
+
+
+static bool der_contains_dns_san(const unsigned char *der, size_t der_len, const char *hostname)
+{
+    if (der == NULL || hostname == NULL) return false;
+    const size_t host_len = strlen(hostname);
+    if (host_len == 0U || host_len > 127U || der_len < host_len + 2U) return false;
+    for (size_t i = 0U; i + 2U + host_len <= der_len; ++i) {
+        if (der[i] == 0x82U && der[i + 1U] == (unsigned char)host_len &&
+            memcmp(der + i + 2U, hostname, host_len) == 0) return true;
+    }
+    return false;
+}
+
+static bool bytes_contain(const unsigned char *haystack, size_t haystack_len,
+                          const unsigned char *needle, size_t needle_len)
+{
+    if (haystack == NULL || needle == NULL || needle_len == 0U || haystack_len < needle_len) return false;
+    for (size_t i = 0U; i + needle_len <= haystack_len; ++i) {
+        if (memcmp(haystack + i, needle, needle_len) == 0) return true;
+    }
+    return false;
+}
+
+static void fingerprint_hex(const uint8_t digest[32], char out[65])
+{
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0U; i < 32U; ++i) {
+        out[i * 2U] = hex[digest[i] >> 4];
+        out[i * 2U + 1U] = hex[digest[i] & 0x0FU];
+    }
+    out[64] = '\0';
+}
+
+esp_err_t acme_client_inspect_stored_certificate(acme_certificate_inspection_t *out_status)
+{
+    if (out_status == NULL) return ESP_ERR_INVALID_ARG;
+    memset(out_status, 0, sizeof(*out_status));
+
+    esp_err_t err = acme_storage_init();
+    if (err != ESP_OK) return err;
+
+    nvs_handle_t handle;
+    err = nvs_open_from_partition("nvs_certs", "acme", NVS_READONLY, &handle);
+    if (err != ESP_OK) return err;
+
+    size_t key_len = 0U, pem_len = 0U, host_len = 0U;
+    esp_err_t key_err = nvs_get_blob(handle, ACME_CERT_KEY_NVS_KEY, NULL, &key_len);
+    esp_err_t pem_err = nvs_get_blob(handle, ACME_CERT_PEM_NVS_KEY, NULL, &pem_len);
+    esp_err_t host_err = nvs_get_str(handle, ACME_CERT_HOST_NVS_KEY, NULL, &host_len);
+    if (key_err == ESP_ERR_NVS_NOT_FOUND || pem_err == ESP_ERR_NVS_NOT_FOUND ||
+        host_err == ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(handle);
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (key_err != ESP_OK || pem_err != ESP_OK || host_err != ESP_OK ||
+        key_len != ACME_CERT_PRIVATE_KEY_LENGTH || pem_len < 64U || pem_len > ACME_RESPONSE_MAX ||
+        host_len < 2U || host_len > ACME_DNS_NAME_MAX_LENGTH + 1U) {
+        nvs_close(handle);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint8_t private_key[ACME_CERT_PRIVATE_KEY_LENGTH];
+    char *pem = calloc(1U, pem_len + 1U);
+    if (pem == NULL) { nvs_close(handle); return ESP_ERR_NO_MEM; }
+    char hostname[ACME_DNS_NAME_MAX_LENGTH + 1U];
+    size_t read_key_len = sizeof(private_key), read_pem_len = pem_len, read_host_len = sizeof(hostname);
+    err = nvs_get_blob(handle, ACME_CERT_KEY_NVS_KEY, private_key, &read_key_len);
+    if (err == ESP_OK) err = nvs_get_blob(handle, ACME_CERT_PEM_NVS_KEY, pem, &read_pem_len);
+    if (err == ESP_OK) err = nvs_get_str(handle, ACME_CERT_HOST_NVS_KEY, hostname, &read_host_len);
+    nvs_close(handle);
+    if (err != ESP_OK) goto cleanup;
+    pem[pem_len] = '\0';
+
+    out_status->key_present = true;
+    out_status->certificate_present = true;
+    out_status->hostname_present = true;
+    out_status->certificate_pem_length = pem_len > 0U && pem[pem_len - 1U] == '\0' ? pem_len - 1U : pem_len;
+    snprintf(out_status->hostname, sizeof(out_status->hostname), "%s", hostname);
+
+    mbedtls_x509_crt chain;
+    mbedtls_x509_crt_init(&chain);
+    const int parse_rc = mbedtls_x509_crt_parse(&chain, (const unsigned char *)pem, pem_len);
+    if (parse_rc != 0) {
+        mbedtls_x509_crt_free(&chain);
+        err = ESP_ERR_INVALID_RESPONSE;
+        goto cleanup;
+    }
+    out_status->certificate_parse_valid = true;
+
+    unsigned count = 0U;
+    for (const mbedtls_x509_crt *crt = &chain; crt != NULL && crt->raw.p != NULL; crt = crt->next) ++count;
+    out_status->chain_certificate_count = count;
+
+    out_status->hostname_matches_certificate =
+        der_contains_dns_san(chain.raw.p, chain.raw.len, hostname);
+
+    uint8_t digest[32];
+    err = sha256_bytes(chain.raw.p, chain.raw.len, digest);
+    if (err == ESP_OK) fingerprint_hex(digest, out_status->leaf_sha256);
+    memset(digest, 0, sizeof(digest));
+    if (err != ESP_OK) { mbedtls_x509_crt_free(&chain); goto cleanup; }
+
+    snprintf(out_status->valid_from, sizeof(out_status->valid_from),
+             "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             chain.valid_from.year, chain.valid_from.mon, chain.valid_from.day,
+             chain.valid_from.hour, chain.valid_from.min, chain.valid_from.sec);
+    snprintf(out_status->valid_to, sizeof(out_status->valid_to),
+             "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             chain.valid_to.year, chain.valid_to.mon, chain.valid_to.day,
+             chain.valid_to.hour, chain.valid_to.min, chain.valid_to.sec);
+
+    psa_key_id_t key_id = 0;
+    err = import_account_key(private_key, PSA_KEY_USAGE_EXPORT, &key_id);
+    if (err == ESP_OK) {
+        uint8_t public_key[65]; size_t public_len = 0U;
+        const psa_status_t ps = psa_export_public_key(key_id, public_key, sizeof(public_key), &public_len);
+        (void)psa_destroy_key(key_id);
+        if (ps == PSA_SUCCESS && public_len == sizeof(public_key) && public_key[0] == 0x04U) {
+            out_status->private_key_matches_certificate =
+                bytes_contain(chain.raw.p, chain.raw.len, public_key, sizeof(public_key));
+        } else {
+            err = ESP_FAIL;
+        }
+        memset(public_key, 0, sizeof(public_key));
+    }
+    mbedtls_x509_crt_free(&chain);
+    if (err == ESP_OK && (!out_status->hostname_matches_certificate ||
+                          !out_status->private_key_matches_certificate)) {
+        err = ESP_ERR_INVALID_STATE;
+    }
+
+cleanup:
+    memset(private_key, 0, sizeof(private_key));
+    if (pem != NULL) { memset(pem, 0, pem_len + 1U); free(pem); }
     return err;
 }
 

@@ -31,7 +31,7 @@ static const char *TAG = "WEB";
 
 #define APP_WEB_CONSOLE_PORT                    443U
 #define APP_WEB_CONSOLE_STACK_SIZE              8192U
-#define APP_WEB_CONSOLE_MAX_HANDLERS            18U
+#define APP_WEB_CONSOLE_MAX_HANDLERS            19U
 #define APP_WEB_CONFIG_BODY_MAX                  1024U
 #define APP_WEB_CONSOLE_MAX_OPEN_SOCKETS        4U
 
@@ -1317,6 +1317,48 @@ static esp_err_t acme_staging_certificate_issue_handler(httpd_req_t *request)
     memset(response,0,4096U); free(response); return send_err;
 }
 
+
+
+static esp_err_t acme_certificate_inspection_handler(httpd_req_t *request)
+{
+    acme_certificate_inspection_t status;
+    const esp_err_t err = acme_client_inspect_stored_certificate(&status);
+    if (err == ESP_ERR_NOT_FOUND) {
+        httpd_resp_set_status(request, "404 Not Found");
+        return httpd_resp_send(request, "No stored ACME certificate", HTTPD_RESP_USE_STRLEN);
+    }
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "Stored certificate inspection failed: %s", esp_err_to_name(err));
+        httpd_resp_set_status(request, "500 Internal Server Error");
+        return httpd_resp_send(request, "Stored certificate inspection failed", HTTPD_RESP_USE_STRLEN);
+    }
+
+    char response[1024];
+    const int length = snprintf(response, sizeof(response),
+        "{\"stored\":true,\"hostname\":\"%s\"," 
+        "\"key_present\":%s,\"certificate_present\":%s,\"hostname_present\":%s,"
+        "\"certificate_parse_valid\":%s,\"hostname_matches_certificate\":%s,"
+        "\"private_key_matches_certificate\":%s,\"chain_certificate_count\":%u,"
+        "\"pem_length\":%u,\"valid_from\":\"%s\",\"valid_to\":\"%s\","
+        "\"leaf_sha256\":\"%s\",\"active_management_tls_changed\":false}\n",
+        status.hostname,
+        status.key_present ? "true" : "false",
+        status.certificate_present ? "true" : "false",
+        status.hostname_present ? "true" : "false",
+        status.certificate_parse_valid ? "true" : "false",
+        status.hostname_matches_certificate ? "true" : "false",
+        status.private_key_matches_certificate ? "true" : "false",
+        status.chain_certificate_count,
+        (unsigned)status.certificate_pem_length,
+        status.valid_from, status.valid_to, status.leaf_sha256);
+    if (length < 0 || length >= (int)sizeof(response))
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "serialization failed");
+    httpd_resp_set_type(request, "application/json");
+    set_security_headers(request);
+    if (err == ESP_ERR_INVALID_STATE) httpd_resp_set_status(request, "409 Conflict");
+    return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t index_handler(httpd_req_t *request)
 {
     static const char html[] =
@@ -1598,6 +1640,15 @@ static const httpd_uri_t s_acme_staging_certificate_issue_uri = {
     .user_ctx = NULL,
 };
 
+
+
+static const httpd_uri_t s_acme_certificate_inspection_uri = {
+    .uri = "/api/v1/acme/certificate",
+    .method = HTTP_GET,
+    .handler = acme_certificate_inspection_handler,
+    .user_ctx = NULL,
+};
+
 esp_err_t web_console_start(void)
 {
     if (s_started) {
@@ -1696,6 +1747,8 @@ esp_err_t web_console_start(void)
     err = httpd_register_uri_handler(s_server, &s_acme_staging_dns01_validate_uri);
     if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
     err = httpd_register_uri_handler(s_server, &s_acme_staging_certificate_issue_uri);
+    if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
+    err = httpd_register_uri_handler(s_server, &s_acme_certificate_inspection_uri);
     if (err != ESP_OK) { (void)httpd_ssl_stop(s_server); s_server = NULL; return err; }
 
     s_started = true;
