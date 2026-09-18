@@ -52,6 +52,14 @@ esp_err_t cloudflare_client_delete_dns01_txt(const char *api_token,
                                              const char *expected_record_name,
                                              int *out_http_status);
 
+/* Delete only after verifying type, name, and exact TXT challenge content. */
+esp_err_t cloudflare_client_delete_dns01_txt_content(const char *api_token,
+                                                     const char *zone_id,
+                                                     const char *record_id,
+                                                     const char *expected_record_name,
+                                                     const char *expected_txt_value,
+                                                     int *out_http_status);
+
 #ifdef __cplusplus
 }
 #endif

@@ -24,6 +24,7 @@
 #include "esp_https_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_system.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -32,7 +33,7 @@ static const char *TAG = "WEB";
 
 #define APP_WEB_CONSOLE_PORT                    443U
 #define APP_WEB_CONSOLE_STACK_SIZE              8192U
-#define APP_WEB_CONSOLE_MAX_HANDLERS            32U
+#define APP_WEB_CONSOLE_MAX_HANDLERS            36U
 #define APP_WEB_CONFIG_BODY_MAX                  1024U
 #define APP_WEB_CONSOLE_MAX_OPEN_SOCKETS        4U
 #define APP_ACME_RENEWAL_CHECK_INTERVAL_MS       (6U * 60U * 60U * 1000U)
@@ -41,6 +42,9 @@ static const char *TAG = "WEB";
 #define APP_ACME_RENEWAL_TASK_PRIORITY               4U
 #define APP_TLS_ACTIVATION_OUTCOME_RECORD_VERSION      1U
 #define APP_TLS_ACTIVATION_OUTCOME_KEY                 "tls_out"
+#define APP_TLS_HANDOFF_RECORD_VERSION                  1U
+#define APP_TLS_HANDOFF_KEY                             "tls_hnd"
+#define APP_TLS_HANDOFF_RETRY_SECONDS                   (6LL * 60LL * 60LL)
 #define APP_ACME_RENEWAL_ATTEMPT_COOLDOWN_SECONDS   (6LL * 60LL * 60LL)
 
 static httpd_handle_t s_server;
@@ -69,6 +73,16 @@ typedef struct {
     char target_leaf_sha256[65];
     char running_leaf_sha256[65];
 } tls_activation_outcome_record_t;
+
+typedef struct {
+    uint32_t version;
+    bool in_progress;
+    bool recovered_interrupted;
+    uint32_t attempt_count;
+    int64_t started_unix;
+    int64_t retry_not_before_unix;
+    char target_leaf_sha256[65];
+} tls_handoff_record_t;
 
 typedef enum {
     ACME_RENEWAL_SCHEDULER_NOT_EVALUATED = 0,
@@ -130,6 +144,13 @@ typedef struct {
     esp_err_t tls_activation_last_transition_result;
     char tls_activation_last_target_leaf_sha256[65];
     char tls_activation_last_running_leaf_sha256[65];
+    bool tls_handoff_state_loaded;
+    bool tls_handoff_in_progress;
+    bool tls_handoff_recovered_interrupted;
+    uint32_t tls_handoff_attempt_count;
+    int64_t tls_handoff_started_unix;
+    int64_t tls_handoff_retry_not_before_unix;
+    char tls_handoff_target_leaf_sha256[65];
 } acme_renewal_scheduler_status_t;
 
 static portMUX_TYPE s_renewal_scheduler_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -154,6 +175,9 @@ static esp_err_t tls_activation_outcome_load(void);
 static esp_err_t tls_activation_outcome_store(bool success, bool lkg_restored, esp_err_t transition_result,
                                               const char *target_leaf_sha256,
                                               const char *running_leaf_sha256);
+static esp_err_t tls_handoff_load_and_reconcile(void);
+static esp_err_t tls_handoff_begin(const char *target_leaf_sha256, int64_t now);
+static esp_err_t tls_handoff_finish(bool success, int64_t now);
 
 static const char *tls_source_name(web_tls_source_t source)
 {
@@ -388,9 +412,9 @@ static esp_err_t renewal_dns01_prepare(const acme_order_discovery_t *order, void
         /* The transaction core only invokes cleanup after a successful prepare.
          * Therefore a partial prepare must remove its own record before failing. */
         int delete_http_status = 0;
-        const esp_err_t delete_err = cloudflare_client_delete_dns01_txt(
+        const esp_err_t delete_err = cloudflare_client_delete_dns01_txt_content(
             dns->credentials.api_token, dns->credentials.zone_id,
-            dns->record_id, order->dns01_record_name, &delete_http_status);
+            dns->record_id, order->dns01_record_name, order->dns01_value, &delete_http_status);
         if (delete_err == ESP_OK) {
             dns->record_created = false;
             memset(dns->record_id, 0, sizeof(dns->record_id));
@@ -413,9 +437,9 @@ static esp_err_t renewal_dns01_cleanup(const acme_order_discovery_t *order, void
     if (!dns->record_created) return ESP_OK;
 
     int delete_http_status = 0;
-    const esp_err_t err = cloudflare_client_delete_dns01_txt(
+    const esp_err_t err = cloudflare_client_delete_dns01_txt_content(
         dns->credentials.api_token, dns->credentials.zone_id,
-        dns->record_id, order->dns01_record_name, &delete_http_status);
+        dns->record_id, order->dns01_record_name, order->dns01_value, &delete_http_status);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Automatic renewal DNS-01 cleanup failed: %s http=%d",
                  esp_err_to_name(err), delete_http_status);
@@ -550,6 +574,113 @@ static esp_err_t tls_activation_outcome_store(bool success, bool lkg_restored, e
     return err;
 }
 
+static void tls_handoff_publish(const tls_handoff_record_t *record)
+{
+    portENTER_CRITICAL(&s_renewal_scheduler_lock);
+    s_renewal_scheduler_status.tls_handoff_state_loaded = true;
+    s_renewal_scheduler_status.tls_handoff_in_progress = record->in_progress;
+    s_renewal_scheduler_status.tls_handoff_recovered_interrupted = record->recovered_interrupted;
+    s_renewal_scheduler_status.tls_handoff_attempt_count = record->attempt_count;
+    s_renewal_scheduler_status.tls_handoff_started_unix = record->started_unix;
+    s_renewal_scheduler_status.tls_handoff_retry_not_before_unix = record->retry_not_before_unix;
+    snprintf(s_renewal_scheduler_status.tls_handoff_target_leaf_sha256,
+             sizeof(s_renewal_scheduler_status.tls_handoff_target_leaf_sha256), "%s",
+             record->target_leaf_sha256);
+    portEXIT_CRITICAL(&s_renewal_scheduler_lock);
+}
+
+static esp_err_t tls_handoff_write(const tls_handoff_record_t *record)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open_from_partition("nvs_certs", "acme", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_blob(handle, APP_TLS_HANDOFF_KEY, record, sizeof(*record));
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    if (err == ESP_OK) tls_handoff_publish(record);
+    return err;
+}
+
+static esp_err_t tls_handoff_read(tls_handoff_record_t *record)
+{
+    if (record == NULL) return ESP_ERR_INVALID_ARG;
+    memset(record, 0, sizeof(*record));
+    record->version = APP_TLS_HANDOFF_RECORD_VERSION;
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open_from_partition("nvs_certs", "acme", NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    if (err != ESP_OK) return err;
+    size_t length = sizeof(*record);
+    err = nvs_get_blob(handle, APP_TLS_HANDOFF_KEY, record, &length);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        memset(record, 0, sizeof(*record));
+        record->version = APP_TLS_HANDOFF_RECORD_VERSION;
+        return ESP_OK;
+    }
+    if (err != ESP_OK) return err;
+    if (length != sizeof(*record) || record->version != APP_TLS_HANDOFF_RECORD_VERSION ||
+        record->target_leaf_sha256[64] != '\0') return ESP_ERR_INVALID_VERSION;
+    return ESP_OK;
+}
+
+static esp_err_t tls_handoff_load_and_reconcile(void)
+{
+    tls_handoff_record_t record;
+    esp_err_t err = tls_handoff_read(&record);
+    if (err != ESP_OK) return err;
+    if (record.in_progress) {
+        int64_t now = 0;
+        (void)get_current_unix_time(&now);
+        record.in_progress = false;
+        record.recovered_interrupted = true;
+        if (now > 0 && record.retry_not_before_unix < now + APP_TLS_HANDOFF_RETRY_SECONDS)
+            record.retry_not_before_unix = now + APP_TLS_HANDOFF_RETRY_SECONDS;
+        err = tls_handoff_write(&record);
+        if (err != ESP_OK) return err;
+        ESP_LOGW(TAG, "Recovered interrupted automatic TLS handoff; retry cooldown retained");
+    } else {
+        tls_handoff_publish(&record);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t tls_handoff_begin(const char *target_leaf_sha256, int64_t now)
+{
+    if (target_leaf_sha256 == NULL || target_leaf_sha256[0] == '\0' || now <= 0)
+        return ESP_ERR_INVALID_ARG;
+    tls_handoff_record_t record;
+    esp_err_t err = tls_handoff_read(&record);
+    if (err != ESP_OK) return err;
+    if (record.in_progress) return ESP_ERR_INVALID_STATE;
+    if (record.retry_not_before_unix > 0 && now < record.retry_not_before_unix)
+        return ESP_ERR_TIMEOUT;
+    record.version = APP_TLS_HANDOFF_RECORD_VERSION;
+    record.in_progress = true;
+    record.recovered_interrupted = false;
+    record.attempt_count++;
+    record.started_unix = now;
+    record.retry_not_before_unix = now + APP_TLS_HANDOFF_RETRY_SECONDS;
+    snprintf(record.target_leaf_sha256, sizeof(record.target_leaf_sha256), "%s", target_leaf_sha256);
+    return tls_handoff_write(&record);
+}
+
+static esp_err_t tls_handoff_finish(bool success, int64_t now)
+{
+    tls_handoff_record_t record;
+    esp_err_t err = tls_handoff_read(&record);
+    if (err != ESP_OK) return err;
+    record.in_progress = false;
+    record.recovered_interrupted = false;
+    if (success) {
+        record.retry_not_before_unix = 0;
+        record.target_leaf_sha256[0] = '\0';
+    } else if (now > 0) {
+        record.retry_not_before_unix = now + APP_TLS_HANDOFF_RETRY_SECONDS;
+    }
+    return tls_handoff_write(&record);
+}
+
 static void tls_activation_intent_publish(const acme_tls_activation_intent_record_t *record,
                                           const char *result)
 {
@@ -671,12 +802,21 @@ static esp_err_t tls_activation_schedule_pending_target(void)
     evaluate_tls_activation_preflight(&preflight, &candidate);
     if (!preflight.tls_activation_preflight_ready) return ESP_ERR_INVALID_STATE;
 
-    if (!tls_transition_try_claim()) return ESP_ERR_INVALID_STATE;
+    int64_t handoff_now = 0;
+    if (!get_current_unix_time(&handoff_now) || handoff_now <= 0) return ESP_ERR_INVALID_STATE;
+    err = tls_handoff_begin(intent.target_leaf_sha256, handoff_now);
+    if (err != ESP_OK) return err;
+
+    if (!tls_transition_try_claim()) {
+        (void)tls_handoff_finish(false, handoff_now);
+        return ESP_ERR_INVALID_STATE;
+    }
     s_tls_transition_automatic = true;
     if (xTaskCreate(tls_transition_task, "tls_auto", 8192U,
                     (void *)(uintptr_t)WEB_TLS_PRODUCTION, 5U, NULL) != pdPASS) {
         s_tls_transition_automatic = false;
         tls_transition_release();
+        (void)tls_handoff_finish(false, handoff_now);
         return ESP_ERR_NO_MEM;
     }
 
@@ -975,6 +1115,14 @@ static void renewal_scheduler_evaluate(void)
     snprintf(next.tls_activation_last_running_leaf_sha256,
              sizeof(next.tls_activation_last_running_leaf_sha256), "%s",
              s_renewal_scheduler_status.tls_activation_last_running_leaf_sha256);
+    next.tls_handoff_state_loaded = s_renewal_scheduler_status.tls_handoff_state_loaded;
+    next.tls_handoff_in_progress = s_renewal_scheduler_status.tls_handoff_in_progress;
+    next.tls_handoff_recovered_interrupted = s_renewal_scheduler_status.tls_handoff_recovered_interrupted;
+    next.tls_handoff_attempt_count = s_renewal_scheduler_status.tls_handoff_attempt_count;
+    next.tls_handoff_started_unix = s_renewal_scheduler_status.tls_handoff_started_unix;
+    next.tls_handoff_retry_not_before_unix = s_renewal_scheduler_status.tls_handoff_retry_not_before_unix;
+    snprintf(next.tls_handoff_target_leaf_sha256, sizeof(next.tls_handoff_target_leaf_sha256), "%s",
+             s_renewal_scheduler_status.tls_handoff_target_leaf_sha256);
     portEXIT_CRITICAL(&s_renewal_scheduler_lock);
     const bool cooldown_clear = next.last_attempt_unix == 0 || now <= 0 ||
                                 now >= next.retry_not_before_unix;
@@ -1035,6 +1183,12 @@ static esp_err_t start_renewal_scheduler(void)
     if (outcome_err != ESP_OK) {
         ESP_LOGE(TAG, "TLS activation outcome-state load failed: %s", esp_err_to_name(outcome_err));
         return outcome_err;
+    }
+
+    const esp_err_t handoff_err = tls_handoff_load_and_reconcile();
+    if (handoff_err != ESP_OK) {
+        ESP_LOGE(TAG, "TLS handoff-state load/reconciliation failed: %s", esp_err_to_name(handoff_err));
+        return handoff_err;
     }
 
     const esp_err_t load_err = renewal_scheduler_load_attempt_state();
@@ -1134,6 +1288,10 @@ static esp_err_t acme_production_renewal_scheduler_handler(httpd_req_t *request)
         "\"tls_activation_last_transition_result\":\"%s\","
         "\"tls_activation_last_target_leaf_sha256\":\"%s\","
         "\"tls_activation_last_running_leaf_sha256\":\"%s\","
+        "\"tls_handoff_state_persistent\":true,\"tls_handoff_state_loaded\":%s,"
+        "\"tls_handoff_in_progress\":%s,\"tls_handoff_recovered_interrupted\":%s,"
+        "\"tls_handoff_attempt_count\":%" PRIu32 ",\"tls_handoff_started_unix\":%" PRId64 ","
+        "\"tls_handoff_retry_not_before_unix\":%" PRId64 ",\"tls_handoff_target_leaf_sha256\":\"%s\","
         "\"tls_management_ca_unchanged\":true,"
         "\"task_started\":%s,\"evaluated\":%s,\"evaluation_count\":%" PRIu32 ","
         "\"check_interval_seconds\":21600,\"last_evaluation_unix\":%" PRId64 ","
@@ -1178,6 +1336,11 @@ static esp_err_t acme_production_renewal_scheduler_handler(httpd_req_t *request)
         status.tls_activation_last_result_valid ? esp_err_to_name(status.tls_activation_last_transition_result) : "none",
         status.tls_activation_last_target_leaf_sha256,
         status.tls_activation_last_running_leaf_sha256,
+        status.tls_handoff_state_loaded ? "true" : "false",
+        status.tls_handoff_in_progress ? "true" : "false",
+        status.tls_handoff_recovered_interrupted ? "true" : "false",
+        status.tls_handoff_attempt_count, status.tls_handoff_started_unix,
+        status.tls_handoff_retry_not_before_unix, status.tls_handoff_target_leaf_sha256,
         status.task_started ? "true" : "false", status.evaluated ? "true" : "false",
         status.evaluation_count, status.last_evaluation_unix, next_check,
         renewal_scheduler_state_name(status.state), status.seconds_remaining, status.days_remaining);
@@ -1307,6 +1470,10 @@ static esp_err_t send_status_json(httpd_req_t *request)
         "\"root_dispersion_16_16\":%" PRIu32
         "},"
         "\"gnss\":{"
+        "\"receiver_identity_valid\":%s,"
+        "\"receiver_model\":\"%s\","
+        "\"receiver_software_version\":\"%s\","
+        "\"receiver_hardware_version\":\"%s\","
         "\"utc_valid\":%s,"
         "\"utc_seconds\":%" PRId64 ","
         "\"fix_valid\":%s,"
@@ -1375,6 +1542,10 @@ static esp_err_t send_status_json(httpd_req_t *request)
         clock_status.holdover_seconds,
         clock_status.root_dispersion_16_16,
 
+        gnss_status.receiver_identity_valid ? "true" : "false",
+        gnss_status.receiver_model,
+        gnss_status.receiver_software_version,
+        gnss_status.receiver_hardware_version,
         gnss_status.utc_valid ? "true" : "false",
         gnss_status.utc_seconds,
         gnss_status.gnss_fix_valid ? "true" : "false",
@@ -1905,10 +2076,14 @@ static esp_err_t dns01_query_handler(httpd_req_t *request)
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid request body");
 
     char record_id[CLOUDFLARE_DNS_RECORD_ID_LENGTH + 1U];
+    char expected_value[CLOUDFLARE_DNS01_VALUE_MAX_LENGTH + 1U];
     if (!extract_json_string(body, "record_id", record_id, sizeof(record_id)) ||
-        !dns_record_id_is_valid(record_id)) {
+        !dns_record_id_is_valid(record_id) ||
+        !extract_json_string(body, "value", expected_value, sizeof(expected_value)) ||
+        expected_value[0] == '\0') {
         memset(body, 0, sizeof(body));
-        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "expected valid record_id");
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
+                                   "expected valid record_id and exact value");
     }
     memset(body, 0, sizeof(body));
 
@@ -1931,8 +2106,8 @@ static esp_err_t dns01_query_handler(httpd_req_t *request)
     }
 
     int http_status = 0;
-    err = cloudflare_client_verify_dns01_txt(credentials.api_token, credentials.zone_id,
-                                             record_id, record_name, &http_status);
+    err = cloudflare_client_verify_dns01_txt_content(credentials.api_token, credentials.zone_id,
+                                                     record_id, record_name, expected_value, &http_status);
     memset(credentials.api_token, 0, sizeof(credentials.api_token));
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "DNS-01 TXT query failed: err=%s http=%d",
@@ -1962,10 +2137,14 @@ static esp_err_t dns01_delete_handler(httpd_req_t *request)
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid request body");
 
     char record_id[CLOUDFLARE_DNS_RECORD_ID_LENGTH + 1U];
+    char expected_value[CLOUDFLARE_DNS01_VALUE_MAX_LENGTH + 1U];
     if (!extract_json_string(body, "record_id", record_id, sizeof(record_id)) ||
-        !dns_record_id_is_valid(record_id)) {
+        !dns_record_id_is_valid(record_id) ||
+        !extract_json_string(body, "value", expected_value, sizeof(expected_value)) ||
+        expected_value[0] == '\0') {
         memset(body, 0, sizeof(body));
-        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "expected valid record_id");
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
+                                   "expected valid record_id and exact value");
     }
     memset(body, 0, sizeof(body));
 
@@ -1986,8 +2165,8 @@ static esp_err_t dns01_delete_handler(httpd_req_t *request)
     }
 
     int http_status = 0;
-    err = cloudflare_client_delete_dns01_txt(credentials.api_token, credentials.zone_id,
-                                             record_id, record_name, &http_status);
+    err = cloudflare_client_delete_dns01_txt_content(credentials.api_token, credentials.zone_id,
+                                                     record_id, record_name, expected_value, &http_status);
     memset(credentials.api_token, 0, sizeof(credentials.api_token));
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "DNS-01 TXT deletion failed/refused: err=%s http=%d", esp_err_to_name(err), http_status);
@@ -2271,9 +2450,9 @@ static esp_err_t acme_staging_dns01_validate_handler(httpd_req_t *request)
 
     /* Cleanup is attempted on success, invalid challenge, timeout, or local error. */
     if (dns_created) {
-        const esp_err_t delete_err = cloudflare_client_delete_dns01_txt(
+        const esp_err_t delete_err = cloudflare_client_delete_dns01_txt_content(
             credentials.api_token, credentials.zone_id, record_id,
-            order.dns01_record_name, &cf_delete_status);
+            order.dns01_record_name, order.dns01_value, &cf_delete_status);
         dns_deleted = (delete_err == ESP_OK);
         if (delete_err != ESP_OK) {
             ESP_LOGE(TAG, "ACME DNS-01 cleanup failed: %s http=%d record_id=%s",
@@ -2378,8 +2557,8 @@ static esp_err_t acme_staging_certificate_issue_handler(httpd_req_t *request)
     }
 
     if (dns_created) {
-        const esp_err_t delete_err=cloudflare_client_delete_dns01_txt(credentials.api_token,
-            credentials.zone_id, record_id, order.dns01_record_name, &cf_delete_status);
+        const esp_err_t delete_err=cloudflare_client_delete_dns01_txt_content(credentials.api_token,
+            credentials.zone_id, record_id, order.dns01_record_name, order.dns01_value, &cf_delete_status);
         dns_deleted=(delete_err==ESP_OK);
         if (delete_err != ESP_OK) ESP_LOGE(TAG,"ACME DNS-01 cleanup failed: %s http=%d record_id=%s",
                                            esp_err_to_name(delete_err),cf_delete_status,record_id);
@@ -2478,8 +2657,8 @@ static esp_err_t production_certificate_issue_for_hostname(httpd_req_t *request,
     }
 
     if (dns_created) {
-        const esp_err_t delete_err=cloudflare_client_delete_dns01_txt(credentials.api_token,
-            credentials.zone_id, record_id, order.dns01_record_name, &cf_delete_status);
+        const esp_err_t delete_err=cloudflare_client_delete_dns01_txt_content(credentials.api_token,
+            credentials.zone_id, record_id, order.dns01_record_name, order.dns01_value, &cf_delete_status);
         dns_deleted=(delete_err==ESP_OK);
         if (delete_err != ESP_OK) ESP_LOGE(TAG,"ACME DNS-01 cleanup failed: %s http=%d record_id=%s",
                                            esp_err_to_name(delete_err),cf_delete_status,record_id);
@@ -2890,153 +3069,162 @@ static esp_err_t acme_certificate_rollback_handler(httpd_req_t *request)
         HTTPD_RESP_USE_STRLEN);
 }
 
+
+static void delayed_reboot_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(1200U));
+    esp_restart();
+}
+
+static esp_err_t system_reboot_handler(httpd_req_t *request)
+{
+    if (xTaskCreate(delayed_reboot_task, "web_reboot", 2048U,
+                    NULL, 5U, NULL) != pdPASS) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "unable to schedule reboot");
+    }
+
+    httpd_resp_set_status(request, "202 Accepted");
+    httpd_resp_set_type(request, "application/json");
+    set_security_headers(request);
+    return httpd_resp_send(request,
+                           "{\"scheduled\":true,\"action\":\"reboot\"}\n",
+                           HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t index_handler(httpd_req_t *request)
 {
     static const char html[] =
-        "<!doctype html>"
-        "<html lang=\"en\">"
-        "<head>"
-        "<meta charset=\"utf-8\">"
-        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-        "<title>ESP32-P4 NTP Console</title>"
-        "<style>"
-        ":root{color-scheme:dark}"
-        "body{margin:0;background:#0d141b;color:#e9f0f5;"
-        "font-family:Arial,sans-serif}"
-        "header{padding:22px 28px;background:#14212d;border-bottom:1px solid #294252}"
-        "h1{margin:0;color:#58c7ff;font-size:1.55rem}"
-        "header p{margin:7px 0 0;color:#a8bac7;font-size:.92rem}"
-        "main{padding:22px;max-width:1320px;margin:auto}"
-        ".summary{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px}"
-        ".badge{padding:8px 12px;border-radius:999px;font-weight:bold;font-size:.82rem}"
-        ".ok{background:#173f2b;color:#9bea75}"
-        ".warn{background:#493b18;color:#ffd569}"
-        ".bad{background:#4c2226;color:#ff9292}"
-        ".neutral{background:#223643;color:#a9d8ef}"
-        ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:18px}"
-        ".card{background:#14212d;border:1px solid #294252;border-radius:10px;"
-        "padding:18px;min-width:0}"
-        ".card h2{margin:0 0 14px;color:#8fdb75;font-size:1.02rem}"
-        ".row{display:grid;grid-template-columns:minmax(135px,1fr) minmax(145px,auto);"
-        "column-gap:30px;row-gap:7px;padding:10px 0;"
-        "border-bottom:1px solid #203440;align-items:center}"
-        ".row:last-child{border-bottom:0}"
-        ".key{color:#9eb2c0;line-height:1.4}"
-        ".value{font-family:ui-monospace,Consolas,monospace;text-align:right;"
-        "line-height:1.4;overflow-wrap:anywhere}"
-        "footer{padding:22px 0 4px;color:#8ca1ae;font-size:.82rem}"
-        "code{color:#9bea75}"
-        "</style>"
-        "</head>"
-        "<body>"
-        "<header>"
-        "<h1>ESP32-P4 GNSS NTP Server</h1>"
-        "<p>mTLS-authenticated HTTPS operational console &middot; automatic refresh every three seconds</p>"
-        "</header>"
-        "<main>"
-        "<div class=\"summary\" id=\"summary\"></div>"
-        "<div class=\"grid\" id=\"cards\"></div>"
-        "<footer>"
-        "mTLS management endpoints: <code>/api/v1/status</code> &middot; "
-        "<code>/api/v1/health</code> &middot; <code>/metrics</code> &middot; "
-        "<code>GET /api/v1/config</code> &middot; <code>PUT /api/v1/config/hostname</code> &middot; <code>PUT/DELETE /api/v1/config/cloudflare</code>"
-        "</footer>"
-        "</main>"
-        "<script>"
-        "function esc(v){return String(v == null ? '--' : v).replace(/[&<>\"']/g,"
-        "c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));}"
-        "function row(k,v){return '<div class=\"row\"><span class=\"key\">'+esc(k)+"
-        "'</span><span class=\"value\">'+esc(v)+'</span></div>';}"
-        "function card(t,r){return '<section class=\"card\"><h2>'+esc(t)+"
-        "'</h2>'+r.join('')+'</section>';}"
-        "function badge(t,c){return '<span class=\"badge '+c+'\">'+esc(t)+'</span>';}"
-        "function stateClass(s){if(s==='SYNCHRONIZED')return 'ok';"
-        "if(s==='HOLDOVER'||s==='ACQUIRING')return 'warn';return 'bad';}"
-        "function yesNo(v){return v?'YES':'NO';}"
-        "function utc(v,valid){if(!valid)return '--';"
-        "return new Date(Number(v)*1000).toISOString();}"
-        "async function refresh(){"
-        "try{"
-        "const r=await fetch('/api/v1/status',{cache:'no-store'});"
-        "if(!r.ok)throw new Error('status unavailable');"
-        "const d=await r.json();"
-        "const summary=[];"
-        "summary.push(badge('Clock: '+d.clock.state,stateClass(d.clock.state)));"
-        "summary.push(badge('NTP: '+(d.readiness.ntp_ready?'READY':'NOT READY'),"
-        "d.readiness.ntp_ready?'ok':'bad'));"
-        "summary.push(badge('GNSS UTC: '+yesNo(d.gnss.utc_valid),"
-        "d.gnss.utc_valid?'ok':'bad'));"
-        "summary.push(badge('PPS: '+yesNo(d.pps.valid),"
-        "d.pps.valid?'ok':'bad'));"
-        "summary.push(badge('Ethernet: '+yesNo(d.device.ipv4_ready),"
-        "d.device.ipv4_ready?'ok':'bad'));"
-        "document.getElementById('summary').innerHTML=summary.join('');"
-        "const c=[];"
-        "c.push(card('Clock and Time',["
-        "row('State',d.clock.state),"
-        "row('Disciplined',yesNo(d.clock.solution_valid)),"
-        "row('UTC Time',utc(d.readiness.unix_time,d.readiness.clock_now_valid)),"
-        "row('Phase Error',d.clock.phase_error_ns+' ns'),"
-        "row('Frequency',d.clock.frequency_ppm+' ppm'),"
-        "row('Samples',d.clock.accepted_samples+' accepted / '+d.clock.rejected_samples+' rejected'),"
-        "row('Holdover',d.clock.holdover_seconds+' s'),"
-        "row('Root Dispersion','0x'+Number(d.clock.root_dispersion_16_16).toString(16))"
-        "]));"
-        "c.push(card('GNSS Receiver',["
-        "row('UTC Valid',yesNo(d.gnss.utc_valid)),"
-        "row('Fix Valid',yesNo(d.gnss.fix_valid)),"
-        "row('Fix Type',d.gnss.fix_type),"
-        "row('Satellites',d.gnss.satellites),"
-        "row('Time Fully Resolved',yesNo(d.gnss.fully_resolved)),"
-        "row('Leap State',d.gnss.leap),"
-        "row('Current Leap Offset',d.gnss.current_leap_seconds+' s'),"
-        "row('TIM-TP qErr',d.gnss.timing_qerr_ps+' ps')"
-        "]));"
-        "c.push(card('PPS Capture',["
-        "row('Interval Valid',yesNo(d.pps.valid)),"
-        "row('Period',d.pps.period_us+' us'),"
-        "row('Jitter',d.pps.jitter_us+' us'),"
-        "row('Last Edge Age',d.pps.age_us+' us'),"
-        "row('Captured Edges',d.pps.edge_count),"
-        "row('Queue Drops',d.pps.queue_drops)"
-        "]));"
-        "c.push(card('Network',["
-        "row('Hostname',d.device.hostname),"
-        "row('IPv4 Address',d.device.ipv4),"
-        "row('Netmask',d.device.netmask),"
-        "row('Gateway',d.device.gateway),"
-        "row('Ethernet Link',yesNo(d.device.link_up)),"
-        "row('Ethernet MAC',d.device.mac),"
-        "row('Console Mode',d.console.mode)"
-        "]));"
-        "c.push(card('NTP Service',["
-        "row('UDP Socket Bound',yesNo(d.ntp.socket_bound)),"
-        "row('Advertised Stratum',d.ntp.advertised_stratum),"
-        "row('Requests Received',d.ntp.requests),"
-        "row('Responses Sent',d.ntp.responses),"
-        "row('Invalid Requests',d.ntp.invalid_requests),"
-        "row('Fail-Closed Drops',d.ntp.unsynchronized_drops),"
-        "row('RATE KoD Responses',d.ntp.rate_kod),"
-        "row('Last Client',d.ntp.last_client)"
-        "]));"
-        "document.getElementById('cards').innerHTML=c.join('');"
-        "}catch(e){"
-        "document.getElementById('summary').innerHTML=badge('Console: STATUS UNAVAILABLE','bad');"
-        "document.getElementById('cards').innerHTML="
-        "'<section class=\"card\"><h2>Console Error</h2><p>Unable to retrieve device status.</p></section>';"
-        "}"
-        "}"
-        "refresh();setInterval(refresh,3000);"
-        "</script>"
-        "</body>"
-        "</html>";
+        "<!doctype html>\n"
+        "<html lang=\"en\"><head>\n"
+        "<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
+        "<title>ESP32-P4 NTP Console</title>\n"
+        "<style>\n"
+        ":root{color-scheme:dark}*{box-sizing:border-box}\n"
+        "body{margin:0;background:#0d141b;color:#e9f0f5;font-family:Arial,sans-serif}\n"
+        "header{padding:22px 28px;background:#14212d;border-bottom:1px solid #294252}\n"
+        "h1{margin:0;color:#58c7ff;font-size:1.55rem}header p{margin:7px 0 0;color:#a8bac7;font-size:.92rem}\n"
+        "main{padding:22px;max-width:1500px;margin:auto;overflow:hidden}\n"
+        ".summary{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}\n"
+        ".badge{padding:8px 12px;border-radius:999px;font-weight:bold;font-size:.82rem}\n"
+        ".ok{background:#173f2b;color:#9bea75}.warn{background:#493b18;color:#ffd569}\n"
+        ".bad{background:#4c2226;color:#ff9292}.neutral{background:#223643;color:#a9d8ef}\n"
+        ".cardcolumns{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;align-items:start}.cardcol{display:flex;flex-direction:column;gap:16px;min-width:0}\n"
+        ".card{background:#14212d;border:1px solid #294252;border-radius:10px;padding:17px;min-width:0;max-width:100%;overflow:hidden}\n"
+        ".card h2{margin:0 0 13px;color:#8fdb75;font-size:1.02rem}\n"
+        ".row{display:grid;grid-template-columns:minmax(0,44%) minmax(0,56%);gap:14px;padding:9px 0;border-bottom:1px solid #203440;align-items:start}\n"
+        ".row:last-child{border-bottom:0}.key{color:#9eb2c0;line-height:1.35;min-width:0}\n"
+        ".value{font-family:ui-monospace,Consolas,monospace;text-align:right;line-height:1.35;min-width:0;max-width:100%;overflow-wrap:anywhere;word-break:break-word;white-space:normal}.nowrap{white-space:nowrap;overflow-wrap:normal;word-break:normal;font-size:clamp(.72rem,.85vw,.92rem)}\n"
+        ".actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}\n"
+        "button{border:1px solid #3d6175;background:#203b4b;color:#e9f0f5;border-radius:7px;padding:10px 14px;font-weight:bold;cursor:pointer}\n"
+        "button:hover{background:#294d61}button.danger{border-color:#81434a;background:#4c2226}button:disabled{opacity:.55;cursor:not-allowed}\n"
+        ".actionmsg{margin-top:12px;color:#a8bac7;overflow-wrap:anywhere}\n"
+        "footer{padding:22px 0 4px;color:#8ca1ae;font-size:.82rem}code{color:#9bea75;overflow-wrap:anywhere}\n"
+        "@media(max-width:1200px){.cardcolumns{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:700px){.cardcolumns{grid-template-columns:1fr}main{padding:12px}.row{grid-template-columns:1fr;gap:4px}.value{text-align:left}header{padding:18px}}\n"
+        "</style></head><body>\n"
+        "<header><h1>ESP32-P4 GNSS NTP Server</h1>\n"
+        "<p>mTLS-authenticated HTTPS operational console &middot; automatic refresh every three seconds</p></header>\n"
+        "<main><div class=\"summary\" id=\"summary\"></div><div id=\"cards\"></div>\n"
+        "<footer>Authenticated management console &middot; NTP timing remains fail-closed</footer></main>\n"
+        "<script>\n"
+        "function esc(v){return String(v==null||v===''?'--':v).replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));}\n"
+        "function row(k,v){return '<div class=\"row\"><span class=\"key\">'+esc(k)+'</span><span class=\"value\">'+esc(v)+'</span></div>';}\n"
+        "function rowNowrap(k,v){return '<div class=\"row\"><span class=\"key\">'+esc(k)+'</span><span class=\"value nowrap\">'+esc(v)+'</span></div>';}\n"
+        "function card(t,r,extra=''){return '<section class=\"card\"><h2>'+esc(t)+'</h2>'+r.join('')+extra+'</section>';}\n"
+        "function badge(t,c){return '<span class=\"badge '+c+'\">'+esc(t)+'</span>';}\n"
+        "function yesNo(v){return v?'YES':'NO';}\n"
+        "function utc(v,valid=true){if(!valid||!v)return '--';try{return new Date(Number(v)*1000).toISOString();}catch(e){return '--';}}\n"
+        "function stateClass(s){if(s==='SYNCHRONIZED'||s==='valid')return'ok';if(s==='HOLDOVER'||s==='ACQUIRING'||s==='renewal_due'||s==='urgent')return'warn';return'bad';}\n"
+        "async function getJson(url){const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error(url+' HTTP '+r.status);return r.json();}\n"
+        "async function action(url,label){\n"
+        " const b=document.getElementById(label);if(b)b.disabled=true;\n"
+        " const m=document.getElementById('actionmsg');m.textContent='Working...';\n"
+        " try{const r=await fetch(url,{method:'POST',cache:'no-store'});const t=await r.text();\n"
+        " m.textContent=(r.ok?'Accepted: ':'Refused: ')+(t||('HTTP '+r.status));}\n"
+        " catch(e){m.textContent='Request error: '+e.message;}\n"
+        " if(b)b.disabled=false;\n"
+        "}\n"
+        "function renew(){if(confirm('Request production certificate renewal now? The existing 30-day renewal policy is still enforced.'))action('/api/v1/acme/production/certificate/renew','renewbtn');}\n"
+        "function reboot(){if(confirm('Reboot the NTP server now? NTP and management HTTPS will be temporarily unavailable.'))action('/api/v1/system/reboot','rebootbtn');}\n"
+        "async function refresh(){\n"
+        " try{\n"
+        "  const [d,cert,sched]=await Promise.all([\n"
+        "   getJson('/api/v1/status'),\n"
+        "   getJson('/api/v1/acme/production/certificate'),\n"
+        "   getJson('/api/v1/acme/production/renewal/scheduler')\n"
+        "  ]);\n"
+        "  const summary=[\n"
+        "   badge('Clock: '+d.clock.state,stateClass(d.clock.state)),\n"
+        "   badge('NTP: '+(d.readiness.ntp_ready?'READY':'NOT READY'),d.readiness.ntp_ready?'ok':'bad'),\n"
+        "   badge('GNSS: '+(d.gnss.receiver_model||'IDENTITY PENDING'),d.gnss.receiver_identity_valid?'ok':'warn'),\n"
+        "   badge('Certificate: '+(cert.certificate_parse_valid?'VALID':'INVALID'),cert.certificate_parse_valid?'ok':'bad'),\n"
+        "   badge('Renewal: '+sched.state,stateClass(sched.state))\n"
+        "  ];\n"
+        "  document.getElementById('summary').innerHTML=summary.join('');\n"
+        "  const col1=[]; const col2=[]; const col3=[]; const col4=[];\n"
+        "  const certValid=cert.certificate_parse_valid&&cert.hostname_matches_certificate&&cert.private_key_matches_certificate;\n"
+        "  col1.push(card('Clock and Time',[\n"
+        "   row('State',d.clock.state),row('Disciplined',yesNo(d.clock.solution_valid)),\n"
+        "   row('UTC Time',utc(d.readiness.unix_time,d.readiness.clock_now_valid)),\n"
+        "   row('Phase Error',d.clock.phase_error_ns+' ns'),row('Frequency',d.clock.frequency_ppm+' ppm'),\n"
+        "   row('Samples',d.clock.accepted_samples+' accepted / '+d.clock.rejected_samples+' rejected'),\n"
+        "   row('Holdover',d.clock.holdover_seconds+' s')]));\n"
+        "  col2.push(card('PPS Capture',[\n"
+        "   row('Interval Valid',yesNo(d.pps.valid)),row('Period',d.pps.period_us+' us'),\n"
+        "   row('Jitter',d.pps.jitter_us+' us'),row('Last Edge Age',d.pps.age_us+' us'),\n"
+        "   row('Captured Edges',d.pps.edge_count),row('Queue Drops',d.pps.queue_drops)]));\n"
+        "  col3.push(card('GNSS Receiver',[\n"
+        "   row('Receiver Model',d.gnss.receiver_model),\n"
+        "   row('Receiver SW',d.gnss.receiver_software_version),\n"
+        "   row('Receiver HW',d.gnss.receiver_hardware_version),\n"
+        "   row('Identity From UBX',yesNo(d.gnss.receiver_identity_valid)),\n"
+        "   row('UTC Valid',yesNo(d.gnss.utc_valid)),row('Fix Valid',yesNo(d.gnss.fix_valid)),\n"
+        "   row('Fix Type',d.gnss.fix_type),row('Satellites',d.gnss.satellites),\n"
+        "   row('Time Fully Resolved',yesNo(d.gnss.fully_resolved)),\n"
+        "   row('Leap State',d.gnss.leap),row('Current Leap Offset',d.gnss.current_leap_seconds+' s'),\n"
+        "   row('TIM-TP qErr',d.gnss.timing_qerr_ps+' ps')]));\n"
+        "  col4.push(card('Certificate & ACME',[\n"
+        "   row('Certificate Valid',yesNo(certValid)),rowNowrap('Hostname',cert.hostname),\n"
+        "   row('Valid From',cert.valid_from),row('Valid To',cert.valid_to),\n"
+        "   row('Days Remaining',sched.days_remaining),row('Renew Before','30 days'),\n"
+        "   row('Scheduler State',sched.state),row('Automatic Renewal',yesNo(sched.automatic_renewal_enabled)),\n"
+        "   row('Automatic TLS Activation',yesNo(sched.automatic_tls_activation)),\n"
+        "   row('Last Renewal Attempt',utc(sched.last_attempt_unix,sched.last_attempt_unix>0)),\n"
+        "   row('Last Attempt Result',sched.last_attempt_result_valid?sched.last_attempt_result:'none'),\n"
+        "   row('Last TLS Activation',utc(sched.tls_activation_last_completed_unix,sched.tls_activation_last_result_valid)),\n"
+        "   row('Active Slot',cert.production_storage?cert.production_storage.active_slot:'--'),\n"
+        "   row('Slot A Valid',cert.production_storage?yesNo(cert.production_storage.slot_a_valid):'--'),\n"
+        "   row('Slot B Valid',cert.production_storage?yesNo(cert.production_storage.slot_b_valid):'--'),\n"
+        "   row('Leaf SHA-256',cert.leaf_sha256),\n"
+        "   row('Running SHA-256',sched.tls_current_leaf_sha256),\n"
+        "   row('Activation Intent Pending',yesNo(sched.tls_activation_intent_pending)),\n"
+        "   row('Handoff In Progress',yesNo(sched.tls_handoff_in_progress))\n"
+        "  ]));\n"
+        "  col1.push(card('NTP Service',[\n"
+        "   row('UDP Socket Bound',yesNo(d.ntp.socket_bound)),row('Advertised Stratum',d.ntp.advertised_stratum),\n"
+        "   row('Leap Indicator',d.ntp.advertised_leap),row('Requests Received',d.ntp.requests),\n"
+        "   row('Responses Sent',d.ntp.responses),row('Invalid Requests',d.ntp.invalid_requests),\n"
+        "   row('Fail-Closed Drops',d.ntp.unsynchronized_drops),row('RATE KoD Responses',d.ntp.rate_kod),\n"
+        "   row('Last Client',d.ntp.last_client)]));\n"
+        "  col2.push(card('Network',[\n"
+        "   row('Hostname',d.device.hostname),row('IPv4 Address',d.device.ipv4),row('Netmask',d.device.netmask),\n"
+        "   row('Gateway',d.device.gateway),row('Ethernet Link',yesNo(d.device.link_up)),row('Ethernet MAC',d.device.mac)]));\n"
+        "  col3.push(card('System Actions',[\n"
+        "   row('Management TLS',d.console.mode),row('Renewal Eligible Now',yesNo(sched.eligible))\n"
+        "  ],'<div class=\"actions\"><button id=\"renewbtn\" onclick=\"renew()\">Renew Certificate</button><button id=\"rebootbtn\" class=\"danger\" onclick=\"reboot()\">Reboot Device</button></div><div id=\"actionmsg\" class=\"actionmsg\">Actions require this authenticated mTLS session.</div>'));\n"
+        "  document.getElementById('cards').innerHTML='<div class=\"cardcolumns\"><div class=\"cardcol\">'+col1.join('')+'</div><div class=\"cardcol\">'+col2.join('')+'</div><div class=\"cardcol\">'+col3.join('')+'</div><div class=\"cardcol\">'+col4.join('')+'</div></div>';\n"
+        " }catch(e){\n"
+        "  document.getElementById('summary').innerHTML=badge('Console: STATUS UNAVAILABLE','bad');\n"
+        "  document.getElementById('cards').innerHTML='<section class=\"card\"><h2>Console Error</h2><p>'+esc(e.message)+'</p></section>';\n"
+        " }\n"
+        "}\n"
+        "refresh();setInterval(refresh,3000);\n"
+        "</script></body></html>\n";
 
     httpd_resp_set_type(request, "text/html");
     set_security_headers(request);
-
-    return httpd_resp_send(request,
-                           html,
-                           HTTPD_RESP_USE_STRLEN);
+    return httpd_resp_send(request, html, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t status_handler(httpd_req_t *request)
@@ -3053,6 +3241,13 @@ static esp_err_t metrics_handler(httpd_req_t *request)
 {
     return send_metrics_response(request);
 }
+
+static const httpd_uri_t s_system_reboot_uri = {
+    .uri = "/api/v1/system/reboot",
+    .method = HTTP_POST,
+    .handler = system_reboot_handler,
+    .user_ctx = NULL,
+};
 
 static const httpd_uri_t s_index_uri = {
     .uri = "/",
@@ -3257,6 +3452,7 @@ static esp_err_t register_all_handlers(httpd_handle_t server)
 {
     const httpd_uri_t *handlers[] = {
         &s_index_uri, &s_status_uri, &s_health_uri, &s_metrics_uri,
+        &s_system_reboot_uri,
         &s_config_get_uri, &s_hostname_put_uri, &s_cloudflare_put_uri,
         &s_cloudflare_delete_uri, &s_cloudflare_verify_uri,
         &s_dns01_create_uri, &s_dns01_query_uri, &s_dns01_delete_uri,
@@ -3451,6 +3647,9 @@ static void tls_transition_task(void *arg)
                                                                        s_active_server_leaf_sha256);
             if (outcome_err != ESP_OK)
                 ESP_LOGE(TAG, "TLS activation succeeded but outcome persistence failed: %s", esp_err_to_name(outcome_err));
+            int64_t handoff_done = 0; (void)get_current_unix_time(&handoff_done);
+            const esp_err_t handoff_err = tls_handoff_finish(true, handoff_done);
+            if (handoff_err != ESP_OK) ESP_LOGE(TAG, "TLS handoff success-state persistence failed: %s", esp_err_to_name(handoff_err));
         }
         ESP_LOGI(TAG, "TLS transition completed: %s -> %s",
                  tls_source_name(previous_source), tls_source_name(target));
@@ -3500,6 +3699,9 @@ static void tls_transition_task(void *arg)
                                                                        automatic_target_leaf_sha256, s_active_server_leaf_sha256);
             if (outcome_err != ESP_OK)
                 ESP_LOGE(TAG, "TLS activation failure outcome persistence failed: %s", esp_err_to_name(outcome_err));
+            int64_t handoff_done = 0; (void)get_current_unix_time(&handoff_done);
+            const esp_err_t handoff_err = tls_handoff_finish(false, handoff_done);
+            if (handoff_err != ESP_OK) ESP_LOGE(TAG, "TLS handoff failure-state persistence failed: %s", esp_err_to_name(handoff_err));
         }
         acme_tls_activation_intent_record_t failed_intent;
         if (acme_client_load_tls_activation_intent(&failed_intent) == ESP_OK && failed_intent.pending) {

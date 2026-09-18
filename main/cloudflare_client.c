@@ -421,6 +421,38 @@ static esp_err_t cloudflare_delete_dns01_txt_sync(const char *api_token,
     return ESP_OK;
 }
 
+static esp_err_t cloudflare_delete_dns01_txt_content_sync(const char *api_token,
+                                                           const char *zone_id,
+                                                           const char *record_id,
+                                                           const char *expected_record_name,
+                                                           const char *expected_txt_value,
+                                                           int *out_http_status)
+{
+    if (api_token == NULL || !is_hex_id(zone_id, APP_CLOUDFLARE_ZONE_ID_LENGTH) ||
+        !is_hex_id(record_id, CLOUDFLARE_DNS_RECORD_ID_LENGTH) || expected_record_name == NULL ||
+        !dns01_value_is_valid(expected_txt_value)) return ESP_ERR_INVALID_ARG;
+
+    char url[CF_URL_MAX];
+    if (snprintf(url, sizeof(url), "https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s",
+                 zone_id, record_id) >= (int)sizeof(url)) return ESP_ERR_INVALID_SIZE;
+
+    int status = 0;
+    esp_err_t err = cloudflare_verify_dns01_txt_content_sync(api_token, zone_id, record_id,
+                                                              expected_record_name, expected_txt_value, &status);
+    if (out_http_status != NULL) *out_http_status = status;
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Refusing to delete DNS record whose exact DNS-01 TXT content does not match");
+        return err;
+    }
+
+    response_buffer_t response;
+    err = cloudflare_http_request(api_token, HTTP_METHOD_DELETE, url, NULL, &response, &status);
+    if (out_http_status != NULL) *out_http_status = status;
+    if (err != ESP_OK) return err;
+    if (status != 200 || !response_success(response.data)) return ESP_ERR_INVALID_RESPONSE;
+    return ESP_OK;
+}
+
 #define CF_WORKER_STACK_SIZE 16384U
 #define CF_WORKER_PRIORITY   5U
 
@@ -430,6 +462,7 @@ typedef enum {
     CF_WORK_VERIFY_DNS01,
     CF_WORK_VERIFY_DNS01_CONTENT,
     CF_WORK_DELETE_DNS01,
+    CF_WORK_DELETE_DNS01_CONTENT,
 } cloudflare_work_type_t;
 
 typedef struct {
@@ -474,6 +507,11 @@ static void cloudflare_worker(void *argument)
         context->result = cloudflare_delete_dns01_txt_sync(
             context->api_token, context->zone_id, context->record_id,
             context->record_name, &context->http_status);
+        break;
+    case CF_WORK_DELETE_DNS01_CONTENT:
+        context->result = cloudflare_delete_dns01_txt_content_sync(
+            context->api_token, context->zone_id, context->record_id,
+            context->record_name, context->txt_value, &context->http_status);
         break;
     default:
         context->result = ESP_ERR_INVALID_ARG;
@@ -618,6 +656,32 @@ esp_err_t cloudflare_client_delete_dns01_txt(const char *api_token,
         snprintf(ctx->zone_id, sizeof(ctx->zone_id), "%s", zone_id) >= (int)sizeof(ctx->zone_id) ||
         snprintf(ctx->record_id, sizeof(ctx->record_id), "%s", record_id) >= (int)sizeof(ctx->record_id) ||
         snprintf(ctx->record_name, sizeof(ctx->record_name), "%s", expected_record_name) >= (int)sizeof(ctx->record_name)) {
+        memset(ctx, 0, sizeof(*ctx)); free(ctx); return ESP_ERR_INVALID_SIZE;
+    }
+    esp_err_t result = run_worker(ctx);
+    if (out_http_status != NULL) *out_http_status = ctx->http_status;
+    memset(ctx, 0, sizeof(*ctx)); free(ctx);
+    return result;
+}
+
+esp_err_t cloudflare_client_delete_dns01_txt_content(const char *api_token,
+                                                     const char *zone_id,
+                                                     const char *record_id,
+                                                     const char *expected_record_name,
+                                                     const char *expected_txt_value,
+                                                     int *out_http_status)
+{
+    if (api_token == NULL || zone_id == NULL || record_id == NULL ||
+        expected_record_name == NULL || expected_txt_value == NULL) return ESP_ERR_INVALID_ARG;
+    if (out_http_status != NULL) *out_http_status = 0;
+    cloudflare_worker_context_t *ctx = calloc(1U, sizeof(*ctx));
+    if (ctx == NULL) return ESP_ERR_NO_MEM;
+    ctx->type = CF_WORK_DELETE_DNS01_CONTENT;
+    if (snprintf(ctx->api_token, sizeof(ctx->api_token), "%s", api_token) >= (int)sizeof(ctx->api_token) ||
+        snprintf(ctx->zone_id, sizeof(ctx->zone_id), "%s", zone_id) >= (int)sizeof(ctx->zone_id) ||
+        snprintf(ctx->record_id, sizeof(ctx->record_id), "%s", record_id) >= (int)sizeof(ctx->record_id) ||
+        snprintf(ctx->record_name, sizeof(ctx->record_name), "%s", expected_record_name) >= (int)sizeof(ctx->record_name) ||
+        snprintf(ctx->txt_value, sizeof(ctx->txt_value), "%s", expected_txt_value) >= (int)sizeof(ctx->txt_value)) {
         memset(ctx, 0, sizeof(*ctx)); free(ctx); return ESP_ERR_INVALID_SIZE;
     }
     esp_err_t result = run_worker(ctx);

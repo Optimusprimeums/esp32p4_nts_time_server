@@ -212,8 +212,19 @@ static bool valid_client_request(const ntp_packet_fields_t *request)
         return false;
     }
 
-    return request->version == NTP_VERSION_3 ||
-           request->version == NTP_VERSION_4;
+    /*
+     * Preserve interoperability with legacy NTP/SNTP clients.
+     *
+     * In particular, w32tm /stripchart can issue Version 1 client-mode
+     * requests. NTP/SNTP servers are expected to interoperate with previous
+     * protocol versions and reply using the request version. Version 0
+     * remains rejected.
+     *
+     * Use numeric bounds for Versions 1 and 2 because ntp_types.h currently
+     * only needs named constants for Versions 3 and 4 elsewhere.
+     */
+    return request->version >= 1U &&
+           request->version <= NTP_VERSION_4;
 }
 
 static void build_rate_kod(const ntp_packet_fields_t *request,

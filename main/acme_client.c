@@ -31,6 +31,7 @@ static const char *TAG = "ACME";
 #define ACME_JWS_MAX            3072U
 #define ACME_WORKER_STACK_SIZE  20480U
 #define ACME_WORKER_PRIORITY        5U
+#define ACME_BAD_NONCE_MAX_RETRIES  1U
 
 typedef struct {
     char data[ACME_RESPONSE_MAX];
@@ -1015,27 +1016,49 @@ static esp_err_t acme_post(const char *url, const char *jws,
     return ESP_OK;
 }
 
+static bool acme_response_is_bad_nonce(const acme_response_buffer_t *response)
+{
+    if (response == NULL || response->data[0] == '\0') return false;
+    char problem_type[ACME_URL_MAX_LENGTH];
+    if (!extract_json_string(response->data, "type", problem_type, sizeof(problem_type))) return false;
+    return strcmp(problem_type, "urn:ietf:params:acme:error:badNonce") == 0;
+}
+
 static esp_err_t signed_request(const char *nonce_url, const char *url,
                                 const char *kid, const char *payload_json,
                                 const uint8_t private_key[32],
                                 acme_response_buffer_t *response,
                                 int *out_http_status)
 {
-    char nonce[ACME_NONCE_MAX];
-    int nonce_status = 0;
-    esp_err_t err = get_nonce(nonce_url, nonce, &nonce_status);
-    if (err != ESP_OK) {
-        if (out_http_status != NULL) *out_http_status = nonce_status;
-        return err;
+    for (unsigned attempt = 0; attempt <= ACME_BAD_NONCE_MAX_RETRIES; ++attempt) {
+        char nonce[ACME_NONCE_MAX];
+        int nonce_status = 0;
+        esp_err_t err = get_nonce(nonce_url, nonce, &nonce_status);
+        if (err != ESP_OK) {
+            if (out_http_status != NULL) *out_http_status = nonce_status;
+            return err;
+        }
+
+        char *jws = calloc(1U, ACME_JWS_MAX);
+        if (jws == NULL) {
+            memset(nonce, 0, sizeof(nonce));
+            return ESP_ERR_NO_MEM;
+        }
+        err = build_kid_jws(url, nonce, kid, payload_json, private_key, jws, ACME_JWS_MAX);
+        memset(nonce, 0, sizeof(nonce));
+        if (err == ESP_OK) err = acme_post(url, jws, response, out_http_status);
+        memset(jws, 0, ACME_JWS_MAX);
+        free(jws);
+        if (err != ESP_OK) return err;
+
+        if (!acme_response_is_bad_nonce(response)) return ESP_OK;
+        if (attempt >= ACME_BAD_NONCE_MAX_RETRIES) {
+            ESP_LOGE(TAG, "ACME badNonce persisted after bounded retry");
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        ESP_LOGW(TAG, "ACME server rejected nonce; retrying request once with a fresh nonce");
     }
-    char *jws = calloc(1U, ACME_JWS_MAX);
-    if (jws == NULL) { memset(nonce, 0, sizeof(nonce)); return ESP_ERR_NO_MEM; }
-    err = build_kid_jws(url, nonce, kid, payload_json, private_key, jws, ACME_JWS_MAX);
-    memset(nonce, 0, sizeof(nonce));
-    if (err == ESP_OK) err = acme_post(url, jws, response, out_http_status);
-    memset(jws, 0, ACME_JWS_MAX);
-    free(jws);
-    return err;
+    return ESP_ERR_INVALID_RESPONSE;
 }
 
 static esp_err_t discover_order_sync(bool production, const char *hostname, acme_order_discovery_t *out)
