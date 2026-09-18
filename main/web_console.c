@@ -24,6 +24,7 @@
 #include "esp_https_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -31,13 +32,15 @@ static const char *TAG = "WEB";
 
 #define APP_WEB_CONSOLE_PORT                    443U
 #define APP_WEB_CONSOLE_STACK_SIZE              8192U
-#define APP_WEB_CONSOLE_MAX_HANDLERS            30U
+#define APP_WEB_CONSOLE_MAX_HANDLERS            32U
 #define APP_WEB_CONFIG_BODY_MAX                  1024U
 #define APP_WEB_CONSOLE_MAX_OPEN_SOCKETS        4U
 #define APP_ACME_RENEWAL_CHECK_INTERVAL_MS       (6U * 60U * 60U * 1000U)
 #define APP_ACME_RENEWAL_INITIAL_DELAY_MS         30000U
 #define APP_ACME_RENEWAL_TASK_STACK_SIZE          8192U
 #define APP_ACME_RENEWAL_TASK_PRIORITY               4U
+#define APP_TLS_ACTIVATION_OUTCOME_RECORD_VERSION      1U
+#define APP_TLS_ACTIVATION_OUTCOME_KEY                 "tls_out"
 #define APP_ACME_RENEWAL_ATTEMPT_COOLDOWN_SECONDS   (6LL * 60LL * 60LL)
 
 static httpd_handle_t s_server;
@@ -50,8 +53,22 @@ typedef enum {
 } web_tls_source_t;
 
 static volatile bool s_tls_transition_pending;
+static volatile bool s_tls_transition_automatic;
+static portMUX_TYPE s_tls_transition_lock = portMUX_INITIALIZER_UNLOCKED;
 static web_tls_source_t s_tls_source = WEB_TLS_EMBEDDED;
 static acme_tls_credentials_t s_active_stored_credentials;
+static char s_active_server_leaf_sha256[65];
+
+typedef struct {
+    uint32_t version;
+    bool result_valid;
+    bool success;
+    bool lkg_restored;
+    int64_t completed_unix;
+    esp_err_t transition_result;
+    char target_leaf_sha256[65];
+    char running_leaf_sha256[65];
+} tls_activation_outcome_record_t;
 
 typedef enum {
     ACME_RENEWAL_SCHEDULER_NOT_EVALUATED = 0,
@@ -88,6 +105,31 @@ typedef struct {
     esp_err_t last_cleanup_result;
     bool attempt_state_loaded;
     bool recovered_interrupted_attempt;
+    bool tls_activation_preflight_evaluated;
+    bool tls_activation_preflight_ready;
+    bool tls_candidate_valid;
+    bool tls_candidate_hostname_match;
+    bool tls_candidate_time_valid;
+    bool tls_candidate_fingerprint_changed;
+    bool tls_activation_in_progress;
+    char tls_candidate_leaf_sha256[65];
+    char tls_current_leaf_sha256[65];
+    char tls_activation_preflight_result[40];
+    bool tls_activation_intent_state_loaded;
+    bool tls_activation_intent_pending;
+    bool tls_activation_boot_reconciled;
+    int64_t tls_activation_intent_created_unix;
+    char tls_activation_intent_previous_leaf_sha256[65];
+    char tls_activation_intent_target_leaf_sha256[65];
+    char tls_activation_reconciliation_result[40];
+    bool tls_activation_outcome_state_loaded;
+    bool tls_activation_last_result_valid;
+    bool tls_activation_last_success;
+    bool tls_activation_last_lkg_restored;
+    int64_t tls_activation_last_completed_unix;
+    esp_err_t tls_activation_last_transition_result;
+    char tls_activation_last_target_leaf_sha256[65];
+    char tls_activation_last_running_leaf_sha256[65];
 } acme_renewal_scheduler_status_t;
 
 static portMUX_TYPE s_renewal_scheduler_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -95,8 +137,23 @@ static acme_renewal_scheduler_status_t s_renewal_scheduler_status;
 static TaskHandle_t s_renewal_scheduler_task;
 
 static esp_err_t start_https_server(web_tls_source_t source);
+static esp_err_t start_https_server_with_credentials(web_tls_source_t source,
+                                                     acme_tls_credentials_t *credentials,
+                                                     const char *known_leaf_sha256);
+static bool tls_transition_try_claim(void);
+static void tls_transition_release(void);
 static void tls_transition_task(void *arg);
 static bool hostname_in_zone(const char *hostname, const char *zone);
+static esp_err_t tls_activation_intent_load_and_reconcile(void);
+static esp_err_t tls_activation_intent_begin(const char *previous_leaf_sha256, int64_t now);
+static esp_err_t tls_activation_intent_set_target(const char *target_leaf_sha256);
+static esp_err_t tls_activation_intent_clear(bool boot_reconciled);
+static esp_err_t tls_activation_schedule_pending_target(void);
+static esp_err_t receive_request_body(httpd_req_t *request, char *body, size_t body_size);
+static esp_err_t tls_activation_outcome_load(void);
+static esp_err_t tls_activation_outcome_store(bool success, bool lkg_restored, esp_err_t transition_result,
+                                              const char *target_leaf_sha256,
+                                              const char *running_leaf_sha256);
 
 static const char *tls_source_name(web_tls_source_t source)
 {
@@ -206,6 +263,64 @@ static bool parse_utc_timestamp(const char *text, int64_t *out_unix)
     const int64_t days = (int64_t)era * 146097LL + (int64_t)doe - 719468LL;
     *out_unix = days * 86400LL + (int64_t)h * 3600LL + (int64_t)mi * 60LL + sec;
     return true;
+}
+
+static void evaluate_tls_activation_preflight(acme_renewal_scheduler_status_t *status,
+                                              const acme_certificate_inspection_t *certificate)
+{
+    if (status == NULL) return;
+
+    status->tls_activation_preflight_evaluated = true;
+    status->tls_activation_in_progress = s_tls_transition_pending;
+    snprintf(status->tls_activation_preflight_result,
+             sizeof(status->tls_activation_preflight_result), "not_ready");
+
+    if (certificate == NULL || !certificate->certificate_parse_valid ||
+        !certificate->private_key_matches_certificate) {
+        snprintf(status->tls_activation_preflight_result,
+                 sizeof(status->tls_activation_preflight_result), "invalid_candidate");
+        return;
+    }
+
+    status->tls_candidate_valid = true;
+    status->tls_candidate_hostname_match = certificate->hostname_matches_certificate;
+    snprintf(status->tls_candidate_leaf_sha256, sizeof(status->tls_candidate_leaf_sha256),
+             "%s", certificate->leaf_sha256);
+    snprintf(status->tls_current_leaf_sha256, sizeof(status->tls_current_leaf_sha256),
+             "%s", s_active_server_leaf_sha256);
+
+    int64_t now = 0, valid_from = 0, valid_to = 0;
+    status->tls_candidate_time_valid =
+        get_current_unix_time(&now) &&
+        parse_utc_timestamp(certificate->valid_from, &valid_from) &&
+        parse_utc_timestamp(certificate->valid_to, &valid_to) &&
+        now >= valid_from && now < valid_to;
+
+    status->tls_candidate_fingerprint_changed =
+        s_active_server_leaf_sha256[0] != '\0' &&
+        certificate->leaf_sha256[0] != '\0' &&
+        strcmp(s_active_server_leaf_sha256, certificate->leaf_sha256) != 0;
+
+    if (!status->tls_candidate_hostname_match) {
+        snprintf(status->tls_activation_preflight_result,
+                 sizeof(status->tls_activation_preflight_result), "hostname_mismatch");
+    } else if (!status->tls_candidate_time_valid) {
+        snprintf(status->tls_activation_preflight_result,
+                 sizeof(status->tls_activation_preflight_result), "time_invalid");
+    } else if (s_active_server_leaf_sha256[0] == '\0') {
+        snprintf(status->tls_activation_preflight_result,
+                 sizeof(status->tls_activation_preflight_result), "current_fingerprint_unavailable");
+    } else if (!status->tls_candidate_fingerprint_changed) {
+        snprintf(status->tls_activation_preflight_result,
+                 sizeof(status->tls_activation_preflight_result), "candidate_not_changed");
+    } else if (status->tls_activation_in_progress) {
+        snprintf(status->tls_activation_preflight_result,
+                 sizeof(status->tls_activation_preflight_result), "activation_in_progress");
+    } else {
+        status->tls_activation_preflight_ready = true;
+        snprintf(status->tls_activation_preflight_result,
+                 sizeof(status->tls_activation_preflight_result), "ready");
+    }
 }
 
 static const char *renewal_scheduler_state_name(acme_renewal_scheduler_state_t state)
@@ -358,6 +473,226 @@ static esp_err_t renewal_scheduler_load_attempt_state(void)
     return ESP_OK;
 }
 
+static void tls_activation_outcome_publish(const tls_activation_outcome_record_t *record)
+{
+    portENTER_CRITICAL(&s_renewal_scheduler_lock);
+    s_renewal_scheduler_status.tls_activation_outcome_state_loaded = true;
+    s_renewal_scheduler_status.tls_activation_last_result_valid = record->result_valid;
+    s_renewal_scheduler_status.tls_activation_last_success = record->success;
+    s_renewal_scheduler_status.tls_activation_last_lkg_restored = record->lkg_restored;
+    s_renewal_scheduler_status.tls_activation_last_completed_unix = record->completed_unix;
+    s_renewal_scheduler_status.tls_activation_last_transition_result = record->transition_result;
+    snprintf(s_renewal_scheduler_status.tls_activation_last_target_leaf_sha256,
+             sizeof(s_renewal_scheduler_status.tls_activation_last_target_leaf_sha256), "%s",
+             record->target_leaf_sha256);
+    snprintf(s_renewal_scheduler_status.tls_activation_last_running_leaf_sha256,
+             sizeof(s_renewal_scheduler_status.tls_activation_last_running_leaf_sha256), "%s",
+             record->running_leaf_sha256);
+    portEXIT_CRITICAL(&s_renewal_scheduler_lock);
+}
+
+static esp_err_t tls_activation_outcome_load(void)
+{
+    tls_activation_outcome_record_t record;
+    memset(&record, 0, sizeof(record));
+    record.version = APP_TLS_ACTIVATION_OUTCOME_RECORD_VERSION;
+
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open_from_partition("nvs_certs", "acme", NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        tls_activation_outcome_publish(&record);
+        return ESP_OK;
+    }
+    if (err != ESP_OK) return err;
+
+    size_t length = sizeof(record);
+    err = nvs_get_blob(handle, APP_TLS_ACTIVATION_OUTCOME_KEY, &record, &length);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        memset(&record, 0, sizeof(record));
+        record.version = APP_TLS_ACTIVATION_OUTCOME_RECORD_VERSION;
+        tls_activation_outcome_publish(&record);
+        return ESP_OK;
+    }
+    if (err != ESP_OK) return err;
+    if (length != sizeof(record) || record.version != APP_TLS_ACTIVATION_OUTCOME_RECORD_VERSION ||
+        record.target_leaf_sha256[64] != '\0' || record.running_leaf_sha256[64] != '\0') {
+        return ESP_ERR_INVALID_VERSION;
+    }
+    tls_activation_outcome_publish(&record);
+    return ESP_OK;
+}
+
+static esp_err_t tls_activation_outcome_store(bool success, bool lkg_restored, esp_err_t transition_result,
+                                              const char *target_leaf_sha256,
+                                              const char *running_leaf_sha256)
+{
+    tls_activation_outcome_record_t record;
+    memset(&record, 0, sizeof(record));
+    record.version = APP_TLS_ACTIVATION_OUTCOME_RECORD_VERSION;
+    record.result_valid = true;
+    record.success = success;
+    record.lkg_restored = lkg_restored;
+    record.transition_result = transition_result;
+    (void)get_current_unix_time(&record.completed_unix);
+    if (target_leaf_sha256 != NULL)
+        snprintf(record.target_leaf_sha256, sizeof(record.target_leaf_sha256), "%s", target_leaf_sha256);
+    if (running_leaf_sha256 != NULL)
+        snprintf(record.running_leaf_sha256, sizeof(record.running_leaf_sha256), "%s", running_leaf_sha256);
+
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open_from_partition("nvs_certs", "acme", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_blob(handle, APP_TLS_ACTIVATION_OUTCOME_KEY, &record, sizeof(record));
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    if (err == ESP_OK) tls_activation_outcome_publish(&record);
+    return err;
+}
+
+static void tls_activation_intent_publish(const acme_tls_activation_intent_record_t *record,
+                                          const char *result)
+{
+    portENTER_CRITICAL(&s_renewal_scheduler_lock);
+    s_renewal_scheduler_status.tls_activation_intent_state_loaded = true;
+    s_renewal_scheduler_status.tls_activation_intent_pending = record->pending;
+    s_renewal_scheduler_status.tls_activation_boot_reconciled = record->boot_reconciled;
+    s_renewal_scheduler_status.tls_activation_intent_created_unix = record->created_unix;
+    snprintf(s_renewal_scheduler_status.tls_activation_intent_previous_leaf_sha256,
+             sizeof(s_renewal_scheduler_status.tls_activation_intent_previous_leaf_sha256),
+             "%s", record->previous_leaf_sha256);
+    snprintf(s_renewal_scheduler_status.tls_activation_intent_target_leaf_sha256,
+             sizeof(s_renewal_scheduler_status.tls_activation_intent_target_leaf_sha256),
+             "%s", record->target_leaf_sha256);
+    snprintf(s_renewal_scheduler_status.tls_activation_reconciliation_result,
+             sizeof(s_renewal_scheduler_status.tls_activation_reconciliation_result),
+             "%s", result != NULL ? result : "none");
+    portEXIT_CRITICAL(&s_renewal_scheduler_lock);
+}
+
+static esp_err_t tls_activation_intent_clear(bool boot_reconciled)
+{
+    acme_tls_activation_intent_record_t record;
+    memset(&record, 0, sizeof(record));
+    record.version = ACME_TLS_ACTIVATION_INTENT_RECORD_VERSION;
+    record.boot_reconciled = boot_reconciled;
+    esp_err_t err = acme_client_store_tls_activation_intent(&record);
+    if (err == ESP_OK)
+        tls_activation_intent_publish(&record, boot_reconciled ? "resolved_on_boot" : "cleared_no_replacement");
+    return err;
+}
+
+static esp_err_t tls_activation_intent_begin(const char *previous_leaf_sha256, int64_t now)
+{
+    if (previous_leaf_sha256 == NULL || previous_leaf_sha256[0] == '\0') return ESP_ERR_INVALID_ARG;
+    acme_tls_activation_intent_record_t record;
+    memset(&record, 0, sizeof(record));
+    record.version = ACME_TLS_ACTIVATION_INTENT_RECORD_VERSION;
+    record.pending = true;
+    record.created_unix = now;
+    snprintf(record.previous_leaf_sha256, sizeof(record.previous_leaf_sha256), "%s", previous_leaf_sha256);
+    esp_err_t err = acme_client_store_tls_activation_intent(&record);
+    if (err == ESP_OK) tls_activation_intent_publish(&record, "pending_target_unknown");
+    return err;
+}
+
+static esp_err_t tls_activation_intent_set_target(const char *target_leaf_sha256)
+{
+    if (target_leaf_sha256 == NULL || target_leaf_sha256[0] == '\0') return ESP_ERR_INVALID_ARG;
+    acme_tls_activation_intent_record_t record;
+    esp_err_t err = acme_client_load_tls_activation_intent(&record);
+    if (err != ESP_OK) return err;
+    if (!record.pending) return ESP_ERR_INVALID_STATE;
+    snprintf(record.target_leaf_sha256, sizeof(record.target_leaf_sha256), "%s", target_leaf_sha256);
+    err = acme_client_store_tls_activation_intent(&record);
+    if (err == ESP_OK) tls_activation_intent_publish(&record, "pending_runtime_handoff");
+    return err;
+}
+
+static esp_err_t tls_activation_intent_load_and_reconcile(void)
+{
+    acme_tls_activation_intent_record_t record;
+    esp_err_t err = acme_client_load_tls_activation_intent(&record);
+    if (err != ESP_OK) return err;
+
+    if (!record.pending) {
+        tls_activation_intent_publish(&record, record.boot_reconciled ? "resolved_on_boot" : "none");
+        return ESP_OK;
+    }
+
+    if (s_tls_source == WEB_TLS_PRODUCTION && s_active_server_leaf_sha256[0] != '\0') {
+        if (record.target_leaf_sha256[0] != '\0' &&
+            strcmp(record.target_leaf_sha256, s_active_server_leaf_sha256) == 0) {
+            return tls_activation_intent_clear(true);
+        }
+        if (record.target_leaf_sha256[0] == '\0' &&
+            record.previous_leaf_sha256[0] != '\0' &&
+            strcmp(record.previous_leaf_sha256, s_active_server_leaf_sha256) != 0) {
+            /* Power loss after dual-slot selector commit but before target fingerprint
+             * was persisted. The production boot path has already loaded the new,
+             * validated selected credential, so reconcile the interrupted intent. */
+            return tls_activation_intent_clear(true);
+        }
+        if (record.target_leaf_sha256[0] == '\0' &&
+            record.previous_leaf_sha256[0] != '\0' &&
+            strcmp(record.previous_leaf_sha256, s_active_server_leaf_sha256) == 0) {
+            return tls_activation_intent_clear(false);
+        }
+    }
+
+    tls_activation_intent_publish(&record, "pending_runtime_handoff");
+    return ESP_OK;
+}
+
+/* Schedule a real production TLS handoff only for a persisted, fully identified
+ * replacement target.  Operator-selected embedded/staging TLS is never
+ * overridden by the automatic path. */
+static esp_err_t tls_activation_schedule_pending_target(void)
+{
+    acme_tls_activation_intent_record_t intent;
+    esp_err_t err = acme_client_load_tls_activation_intent(&intent);
+    if (err != ESP_OK) return err;
+    if (!intent.pending || intent.target_leaf_sha256[0] == '\0') return ESP_ERR_INVALID_STATE;
+    if (s_tls_source != WEB_TLS_PRODUCTION || s_active_server_leaf_sha256[0] == '\0')
+        return ESP_ERR_INVALID_STATE;
+
+    acme_certificate_inspection_t candidate;
+    memset(&candidate, 0, sizeof(candidate));
+    err = acme_client_inspect_stored_production_certificate(&candidate);
+    if (err != ESP_OK || !candidate.certificate_parse_valid ||
+        !candidate.private_key_matches_certificate ||
+        !candidate.hostname_matches_certificate ||
+        strcmp(candidate.leaf_sha256, intent.target_leaf_sha256) != 0) {
+        return err == ESP_OK ? ESP_ERR_INVALID_STATE : err;
+    }
+
+    acme_renewal_scheduler_status_t preflight;
+    memset(&preflight, 0, sizeof(preflight));
+    evaluate_tls_activation_preflight(&preflight, &candidate);
+    if (!preflight.tls_activation_preflight_ready) return ESP_ERR_INVALID_STATE;
+
+    if (!tls_transition_try_claim()) return ESP_ERR_INVALID_STATE;
+    s_tls_transition_automatic = true;
+    if (xTaskCreate(tls_transition_task, "tls_auto", 8192U,
+                    (void *)(uintptr_t)WEB_TLS_PRODUCTION, 5U, NULL) != pdPASS) {
+        s_tls_transition_automatic = false;
+        tls_transition_release();
+        return ESP_ERR_NO_MEM;
+    }
+
+    portENTER_CRITICAL(&s_renewal_scheduler_lock);
+    s_renewal_scheduler_status.tls_activation_in_progress = true;
+    s_renewal_scheduler_status.tls_activation_preflight_ready = false;
+    snprintf(s_renewal_scheduler_status.tls_activation_preflight_result,
+             sizeof(s_renewal_scheduler_status.tls_activation_preflight_result),
+             "activation_scheduled");
+    snprintf(s_renewal_scheduler_status.tls_activation_reconciliation_result,
+             sizeof(s_renewal_scheduler_status.tls_activation_reconciliation_result),
+             "runtime_handoff_scheduled");
+    portEXIT_CRITICAL(&s_renewal_scheduler_lock);
+    return ESP_OK;
+}
+
 static void renewal_scheduler_execute_if_ready(void)
 {
     acme_renewal_scheduler_status_t snapshot;
@@ -451,15 +786,57 @@ static void renewal_scheduler_execute_if_ready(void)
         .cleanup_dns01 = renewal_dns01_cleanup,
         .context = &dns,
     };
+
+    /* Persist activation intent immediately before the transaction can replace
+     * the selected production slot. No TLS transition is scheduled in 5B.10f.3c. */
+    result = tls_activation_intent_begin(certificate.leaf_sha256, now);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Automatic renewal aborted: TLS activation intent commit failed: %s",
+                 esp_err_to_name(result));
+        goto clear_dns_context;
+    }
+
     ESP_LOGI(TAG, "Automatic production renewal attempt starting for %s; TLS activation disabled",
              certificate.hostname);
     result = acme_client_run_production_certificate_transaction(
         certificate.hostname, &hooks, &transaction);
 
+    if (transaction.certificate.stored) {
+        acme_certificate_inspection_t replacement;
+        memset(&replacement, 0, sizeof(replacement));
+        const esp_err_t inspect_replacement =
+            acme_client_inspect_stored_production_certificate(&replacement);
+        if (inspect_replacement == ESP_OK && replacement.certificate_parse_valid &&
+            replacement.private_key_matches_certificate && replacement.leaf_sha256[0] != '\0') {
+            const esp_err_t intent_err = tls_activation_intent_set_target(replacement.leaf_sha256);
+            if (intent_err != ESP_OK) {
+                ESP_LOGE(TAG, "Replacement stored but TLS activation target persistence failed: %s",
+                         esp_err_to_name(intent_err));
+            } else {
+                const esp_err_t activation_err = tls_activation_schedule_pending_target();
+                if (activation_err != ESP_OK) {
+                    ESP_LOGE(TAG, "Replacement stored but automatic TLS handoff was not scheduled: %s",
+                             esp_err_to_name(activation_err));
+                } else {
+                    ESP_LOGI(TAG, "Automatic production TLS handoff scheduled for replacement %s",
+                             replacement.leaf_sha256);
+                }
+            }
+        } else {
+            ESP_LOGE(TAG, "Replacement stored but TLS activation target inspection failed: %s",
+                     esp_err_to_name(inspect_replacement));
+        }
+    } else {
+        const esp_err_t intent_err = tls_activation_intent_clear(false);
+        if (intent_err != ESP_OK)
+            ESP_LOGE(TAG, "TLS activation intent cleanup after non-replacement failed: %s",
+                     esp_err_to_name(intent_err));
+    }
+
     ESP_LOGI(TAG,
              "Automatic production renewal attempt finished: result=%s completed=%d "
              "dns_prepared=%d cleanup_attempted=%d cleanup_result=%s "
-             "automatic_tls_activation=false",
+             "automatic_tls_activation=true",
              esp_err_to_name(result), transaction.completed,
              transaction.dns01_prepared, transaction.cleanup_attempted,
              esp_err_to_name(transaction.cleanup_result));
@@ -563,10 +940,53 @@ static void renewal_scheduler_evaluate(void)
     next.last_cleanup_result = s_renewal_scheduler_status.last_cleanup_result;
     next.attempt_state_loaded = s_renewal_scheduler_status.attempt_state_loaded;
     next.recovered_interrupted_attempt = s_renewal_scheduler_status.recovered_interrupted_attempt;
+    next.tls_activation_intent_state_loaded = s_renewal_scheduler_status.tls_activation_intent_state_loaded;
+    next.tls_activation_intent_pending = s_renewal_scheduler_status.tls_activation_intent_pending;
+    next.tls_activation_boot_reconciled = s_renewal_scheduler_status.tls_activation_boot_reconciled;
+    next.tls_activation_intent_created_unix = s_renewal_scheduler_status.tls_activation_intent_created_unix;
+    snprintf(next.tls_activation_intent_previous_leaf_sha256,
+             sizeof(next.tls_activation_intent_previous_leaf_sha256), "%s",
+             s_renewal_scheduler_status.tls_activation_intent_previous_leaf_sha256);
+    snprintf(next.tls_activation_intent_target_leaf_sha256,
+             sizeof(next.tls_activation_intent_target_leaf_sha256), "%s",
+             s_renewal_scheduler_status.tls_activation_intent_target_leaf_sha256);
+    snprintf(next.tls_activation_reconciliation_result,
+             sizeof(next.tls_activation_reconciliation_result), "%s",
+             s_renewal_scheduler_status.tls_activation_reconciliation_result);
+
+    /* 5B.10g.1.1: protected automatic TLS activation outcome state is loaded
+     * before the scheduler task starts. Preserve it across each freshly built
+     * evaluation snapshot just like attempt and activation-intent state. */
+    next.tls_activation_outcome_state_loaded =
+        s_renewal_scheduler_status.tls_activation_outcome_state_loaded;
+    next.tls_activation_last_result_valid =
+        s_renewal_scheduler_status.tls_activation_last_result_valid;
+    next.tls_activation_last_success =
+        s_renewal_scheduler_status.tls_activation_last_success;
+    next.tls_activation_last_lkg_restored =
+        s_renewal_scheduler_status.tls_activation_last_lkg_restored;
+    next.tls_activation_last_completed_unix =
+        s_renewal_scheduler_status.tls_activation_last_completed_unix;
+    next.tls_activation_last_transition_result =
+        s_renewal_scheduler_status.tls_activation_last_transition_result;
+    snprintf(next.tls_activation_last_target_leaf_sha256,
+             sizeof(next.tls_activation_last_target_leaf_sha256), "%s",
+             s_renewal_scheduler_status.tls_activation_last_target_leaf_sha256);
+    snprintf(next.tls_activation_last_running_leaf_sha256,
+             sizeof(next.tls_activation_last_running_leaf_sha256), "%s",
+             s_renewal_scheduler_status.tls_activation_last_running_leaf_sha256);
     portEXIT_CRITICAL(&s_renewal_scheduler_lock);
     const bool cooldown_clear = next.last_attempt_unix == 0 || now <= 0 ||
                                 now >= next.retry_not_before_unix;
     next.execution_preflight_ready = next.eligible && !next.attempt_in_progress && cooldown_clear;
+
+    /* 5B.10f.1: observe whether the stored production credential would be a
+     * safe, distinct TLS handoff candidate. This is deliberately non-activating. */
+    if (inspect_err == ESP_OK || inspect_err == ESP_ERR_INVALID_STATE) {
+        evaluate_tls_activation_preflight(&next, &certificate);
+    } else {
+        evaluate_tls_activation_preflight(&next, NULL);
+    }
 
     portENTER_CRITICAL(&s_renewal_scheduler_lock);
     s_renewal_scheduler_status = next;
@@ -586,6 +1006,17 @@ static void renewal_scheduler_task(void *arg)
     for (;;) {
         renewal_scheduler_evaluate();
         renewal_scheduler_execute_if_ready();
+
+        /* Retry a persisted, identified replacement target at scheduler cadence. */
+        acme_tls_activation_intent_record_t pending_intent;
+        if (acme_client_load_tls_activation_intent(&pending_intent) == ESP_OK &&
+            pending_intent.pending && pending_intent.target_leaf_sha256[0] != '\0' &&
+            !s_tls_transition_pending) {
+            const esp_err_t activation_err = tls_activation_schedule_pending_target();
+            if (activation_err != ESP_OK && activation_err != ESP_ERR_INVALID_STATE)
+                ESP_LOGW(TAG, "Pending automatic TLS handoff retry not scheduled: %s",
+                         esp_err_to_name(activation_err));
+        }
         vTaskDelay(pdMS_TO_TICKS(APP_ACME_RENEWAL_CHECK_INTERVAL_MS));
     }
 }
@@ -593,6 +1024,18 @@ static void renewal_scheduler_task(void *arg)
 static esp_err_t start_renewal_scheduler(void)
 {
     if (s_renewal_scheduler_task != NULL) return ESP_OK;
+
+    const esp_err_t intent_err = tls_activation_intent_load_and_reconcile();
+    if (intent_err != ESP_OK) {
+        ESP_LOGE(TAG, "TLS activation intent load/reconciliation failed: %s", esp_err_to_name(intent_err));
+        return intent_err;
+    }
+
+    const esp_err_t outcome_err = tls_activation_outcome_load();
+    if (outcome_err != ESP_OK) {
+        ESP_LOGE(TAG, "TLS activation outcome-state load failed: %s", esp_err_to_name(outcome_err));
+        return outcome_err;
+    }
 
     const esp_err_t load_err = renewal_scheduler_load_attempt_state();
     if (load_err != ESP_OK) {
@@ -660,11 +1103,11 @@ static esp_err_t acme_production_renewal_scheduler_handler(httpd_req_t *request)
 
     const int64_t next_check = status.last_evaluation_unix > 0
                                  ? status.last_evaluation_unix + 21600LL : 0LL;
-    char response[1280];
+    char response[3072];
     const int length = snprintf(response, sizeof(response),
         "{\"enabled\":true,\"mode\":\"automatic_execution\","
         "\"automatic_renewal_enabled\":%s,\"automatic_certificate_replacement\":true,"
-        "\"automatic_tls_activation\":false,\"automatic_acme_execution\":true,"
+        "\"automatic_tls_activation\":true,\"automatic_acme_execution\":true,"
         "\"eligible\":%s,\"eligibility_reason\":\"%s\","
         "\"execution_preflight_ready\":%s,\"attempt_in_progress\":%s,"
         "\"attempt_count\":%" PRIu32 ",\"last_attempt_unix\":%" PRId64 ","
@@ -674,6 +1117,24 @@ static esp_err_t acme_production_renewal_scheduler_handler(httpd_req_t *request)
         "\"last_dns01_prepared\":%s,\"last_cleanup_attempted\":%s,"
         "\"last_cleanup_result\":\"%s\","
         "\"attempt_observability_persistent\":true,""\"attempt_state_loaded\":%s,\"recovered_interrupted_attempt\":%s,"
+        "\"tls_activation_preflight_evaluated\":%s,\"tls_activation_preflight_ready\":%s,"
+        "\"tls_candidate_valid\":%s,\"tls_candidate_hostname_match\":%s,"
+        "\"tls_candidate_time_valid\":%s,\"tls_candidate_fingerprint_changed\":%s,"
+        "\"tls_activation_in_progress\":%s,\"tls_candidate_leaf_sha256\":\"%s\","
+        "\"tls_current_leaf_sha256\":\"%s\",\"tls_activation_preflight_result\":\"%s\","
+        "\"tls_activation_intent_persistent\":true,\"tls_activation_intent_state_loaded\":%s,"
+        "\"tls_activation_intent_pending\":%s,\"tls_activation_boot_reconciled\":%s,"
+        "\"tls_activation_intent_created_unix\":%" PRId64 ","
+        "\"tls_activation_intent_previous_leaf_sha256\":\"%s\","
+        "\"tls_activation_intent_target_leaf_sha256\":\"%s\","
+        "\"tls_activation_reconciliation_result\":\"%s\","
+        "\"tls_activation_outcome_persistent\":true,\"tls_activation_outcome_state_loaded\":%s,"
+        "\"tls_activation_last_result_valid\":%s,\"tls_activation_last_success\":%s,"
+        "\"tls_activation_last_lkg_restored\":%s,\"tls_activation_last_completed_unix\":%" PRId64 ","
+        "\"tls_activation_last_transition_result\":\"%s\","
+        "\"tls_activation_last_target_leaf_sha256\":\"%s\","
+        "\"tls_activation_last_running_leaf_sha256\":\"%s\","
+        "\"tls_management_ca_unchanged\":true,"
         "\"task_started\":%s,\"evaluated\":%s,\"evaluation_count\":%" PRIu32 ","
         "\"check_interval_seconds\":21600,\"last_evaluation_unix\":%" PRId64 ","
         "\"next_check_unix\":%" PRId64 ",\"state\":\"%s\","
@@ -693,6 +1154,30 @@ static esp_err_t acme_production_renewal_scheduler_handler(httpd_req_t *request)
         status.last_cleanup_attempted ? esp_err_to_name(status.last_cleanup_result) : "none",
         status.attempt_state_loaded ? "true" : "false",
         status.recovered_interrupted_attempt ? "true" : "false",
+        status.tls_activation_preflight_evaluated ? "true" : "false",
+        status.tls_activation_preflight_ready ? "true" : "false",
+        status.tls_candidate_valid ? "true" : "false",
+        status.tls_candidate_hostname_match ? "true" : "false",
+        status.tls_candidate_time_valid ? "true" : "false",
+        status.tls_candidate_fingerprint_changed ? "true" : "false",
+        status.tls_activation_in_progress ? "true" : "false",
+        status.tls_candidate_leaf_sha256, status.tls_current_leaf_sha256,
+        status.tls_activation_preflight_result,
+        status.tls_activation_intent_state_loaded ? "true" : "false",
+        status.tls_activation_intent_pending ? "true" : "false",
+        status.tls_activation_boot_reconciled ? "true" : "false",
+        status.tls_activation_intent_created_unix,
+        status.tls_activation_intent_previous_leaf_sha256,
+        status.tls_activation_intent_target_leaf_sha256,
+        status.tls_activation_reconciliation_result,
+        status.tls_activation_outcome_state_loaded ? "true" : "false",
+        status.tls_activation_last_result_valid ? "true" : "false",
+        status.tls_activation_last_success ? "true" : "false",
+        status.tls_activation_last_lkg_restored ? "true" : "false",
+        status.tls_activation_last_completed_unix,
+        status.tls_activation_last_result_valid ? esp_err_to_name(status.tls_activation_last_transition_result) : "none",
+        status.tls_activation_last_target_leaf_sha256,
+        status.tls_activation_last_running_leaf_sha256,
         status.task_started ? "true" : "false", status.evaluated ? "true" : "false",
         status.evaluation_count, status.last_evaluation_unix, next_check,
         renewal_scheduler_state_name(status.state), status.seconds_remaining, status.days_remaining);
@@ -2302,12 +2787,27 @@ static esp_err_t acme_production_certificate_export_handler(httpd_req_t *request
     return send_err;
 }
 
+static bool tls_transition_try_claim(void)
+{
+    bool claimed = false;
+    taskENTER_CRITICAL(&s_tls_transition_lock);
+    if (!s_tls_transition_pending) {
+        s_tls_transition_pending = true;
+        claimed = true;
+    }
+    taskEXIT_CRITICAL(&s_tls_transition_lock);
+    return claimed;
+}
+
+static void tls_transition_release(void)
+{
+    taskENTER_CRITICAL(&s_tls_transition_lock);
+    s_tls_transition_pending = false;
+    taskEXIT_CRITICAL(&s_tls_transition_lock);
+}
+
 static esp_err_t acme_certificate_activate_test_handler(httpd_req_t *request)
 {
-    if (s_tls_transition_pending) {
-        httpd_resp_set_status(request, "409 Conflict");
-        return httpd_resp_send(request, "TLS transition already pending", HTTPD_RESP_USE_STRLEN);
-    }
     if (s_tls_source == WEB_TLS_STORED_TEST) {
         httpd_resp_set_type(request, "application/json"); set_security_headers(request);
         return httpd_resp_send(request, "{\"scheduled\":false,\"active_tls_source\":\"stored_staging_test\"}\n", HTTPD_RESP_USE_STRLEN);
@@ -2319,10 +2819,13 @@ static esp_err_t acme_certificate_activate_test_handler(httpd_req_t *request)
         httpd_resp_set_status(request, "409 Conflict");
         return httpd_resp_send(request, "Stored certificate is not eligible for test activation", HTTPD_RESP_USE_STRLEN);
     }
-    s_tls_transition_pending = true;
+    if (!tls_transition_try_claim()) {
+        httpd_resp_set_status(request, "409 Conflict");
+        return httpd_resp_send(request, "TLS transition already pending", HTTPD_RESP_USE_STRLEN);
+    }
     if (xTaskCreate(tls_transition_task, "tls_switch", 8192U,
                     (void *)(uintptr_t)WEB_TLS_STORED_TEST, 5U, NULL) != pdPASS) {
-        s_tls_transition_pending = false;
+        tls_transition_release();
         return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "unable to schedule TLS transition");
     }
     httpd_resp_set_status(request, "202 Accepted");
@@ -2334,10 +2837,6 @@ static esp_err_t acme_certificate_activate_test_handler(httpd_req_t *request)
 
 static esp_err_t acme_production_certificate_activate_handler(httpd_req_t *request)
 {
-    if (s_tls_transition_pending) {
-        httpd_resp_set_status(request, "409 Conflict");
-        return httpd_resp_send(request, "TLS transition already pending", HTTPD_RESP_USE_STRLEN);
-    }
     acme_certificate_inspection_t inspection;
     const esp_err_t inspect_err = acme_client_inspect_stored_production_certificate(&inspection);
     if (inspect_err != ESP_OK || !inspection.certificate_parse_valid ||
@@ -2351,10 +2850,13 @@ static esp_err_t acme_production_certificate_activate_handler(httpd_req_t *reque
         httpd_resp_set_type(request, "application/json"); set_security_headers(request);
         return httpd_resp_send(request, "{\"scheduled\":false,\"active_tls_source\":\"stored_production\",\"persistent\":true}\n", HTTPD_RESP_USE_STRLEN);
     }
-    s_tls_transition_pending = true;
+    if (!tls_transition_try_claim()) {
+        httpd_resp_set_status(request, "409 Conflict");
+        return httpd_resp_send(request, "TLS transition already pending", HTTPD_RESP_USE_STRLEN);
+    }
     if (xTaskCreate(tls_transition_task, "tls_prod", 8192U,
                     (void *)(uintptr_t)WEB_TLS_PRODUCTION, 5U, NULL) != pdPASS) {
-        s_tls_transition_pending = false;
+        tls_transition_release();
         return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "unable to schedule production TLS activation");
     }
     httpd_resp_set_status(request, "202 Accepted");
@@ -2366,20 +2868,19 @@ static esp_err_t acme_production_certificate_activate_handler(httpd_req_t *reque
 
 static esp_err_t acme_certificate_rollback_handler(httpd_req_t *request)
 {
-    if (s_tls_transition_pending) {
-        httpd_resp_set_status(request, "409 Conflict");
-        return httpd_resp_send(request, "TLS transition already pending", HTTPD_RESP_USE_STRLEN);
-    }
     if (s_tls_source == WEB_TLS_EMBEDDED) {
         const esp_err_t pref_err = acme_client_set_production_boot_selected(false);
         if (pref_err != ESP_OK) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "unable to persist embedded TLS boot selection");
         httpd_resp_set_type(request, "application/json"); set_security_headers(request);
         return httpd_resp_send(request, "{\"scheduled\":false,\"active_tls_source\":\"embedded_development\",\"persistent\":true}\n", HTTPD_RESP_USE_STRLEN);
     }
-    s_tls_transition_pending = true;
+    if (!tls_transition_try_claim()) {
+        httpd_resp_set_status(request, "409 Conflict");
+        return httpd_resp_send(request, "TLS transition already pending", HTTPD_RESP_USE_STRLEN);
+    }
     if (xTaskCreate(tls_transition_task, "tls_rollback", 8192U,
                     (void *)(uintptr_t)WEB_TLS_EMBEDDED, 5U, NULL) != pdPASS) {
-        s_tls_transition_pending = false;
+        tls_transition_release();
         return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "unable to schedule TLS rollback");
     }
     httpd_resp_set_status(request, "202 Accepted");
@@ -2723,6 +3224,8 @@ static const httpd_uri_t s_acme_production_renewal_scheduler_put_uri = {
 };
 
 
+
+
 static const httpd_uri_t s_acme_production_certificate_export_uri = {
     .uri = "/api/v1/acme/production/certificate/export",
     .method = HTTP_GET,
@@ -2766,7 +3269,8 @@ static esp_err_t register_all_handlers(httpd_handle_t server)
         &s_acme_production_renewal_scheduler_uri, &s_acme_production_renewal_scheduler_put_uri,
         &s_acme_production_certificate_export_uri,
         &s_acme_certificate_activate_test_uri,
-        &s_acme_production_certificate_activate_uri, &s_acme_certificate_rollback_uri,
+        &s_acme_production_certificate_activate_uri,
+        &s_acme_certificate_rollback_uri,
     };
     for (size_t i = 0U; i < sizeof(handlers) / sizeof(handlers[0]); ++i) {
         const esp_err_t err = httpd_register_uri_handler(server, handlers[i]);
@@ -2818,6 +3322,14 @@ static esp_err_t start_https_server(web_tls_source_t source)
     s_server = server;
     s_started = true;
     s_tls_source = source;
+    memset(s_active_server_leaf_sha256, 0, sizeof(s_active_server_leaf_sha256));
+    if (source == WEB_TLS_PRODUCTION) {
+        acme_certificate_inspection_t active_inspection;
+        if (acme_client_inspect_stored_production_certificate(&active_inspection) == ESP_OK) {
+            snprintf(s_active_server_leaf_sha256, sizeof(s_active_server_leaf_sha256),
+                     "%s", active_inspection.leaf_sha256);
+        }
+    }
     if (source == WEB_TLS_STORED_TEST || source == WEB_TLS_PRODUCTION) {
         s_active_stored_credentials = candidate;
         memset(&candidate, 0, sizeof(candidate));
@@ -2828,44 +3340,179 @@ static esp_err_t start_https_server(web_tls_source_t source)
     return ESP_OK;
 }
 
+static esp_err_t start_https_server_with_credentials(web_tls_source_t source,
+                                                     acme_tls_credentials_t *credentials,
+                                                     const char *known_leaf_sha256)
+{
+    if (source == WEB_TLS_EMBEDDED) return start_https_server(WEB_TLS_EMBEDDED);
+    if (credentials == NULL || credentials->certificate_pem == NULL ||
+        credentials->private_key_pem == NULL) return ESP_ERR_INVALID_ARG;
+
+    httpd_ssl_config_t config = HTTPD_SSL_CONFIG_DEFAULT();
+    config.httpd.stack_size = APP_WEB_CONSOLE_STACK_SIZE;
+    config.httpd.max_uri_handlers = APP_WEB_CONSOLE_MAX_HANDLERS;
+    config.httpd.max_open_sockets = APP_WEB_CONSOLE_MAX_OPEN_SOCKETS;
+    config.httpd.lru_purge_enable = true;
+    config.transport_mode = HTTPD_SSL_TRANSPORT_SECURE;
+    config.port_secure = APP_WEB_CONSOLE_PORT;
+    config.cacert_pem = management_ca_pem_start;
+    config.cacert_len = (size_t)(management_ca_pem_end - management_ca_pem_start);
+    config.servercert = (const uint8_t *)credentials->certificate_pem;
+    config.servercert_len = credentials->certificate_pem_length;
+    config.prvtkey_pem = (const uint8_t *)credentials->private_key_pem;
+    config.prvtkey_len = credentials->private_key_pem_length;
+
+    httpd_handle_t server = NULL;
+    esp_err_t err = httpd_ssl_start(&server, &config);
+    if (err == ESP_OK) err = register_all_handlers(server);
+    if (err != ESP_OK) {
+        if (server != NULL) (void)httpd_ssl_stop(server);
+        return err;
+    }
+
+    s_server = server;
+    s_started = true;
+    s_tls_source = source;
+    s_active_stored_credentials = *credentials;
+    memset(credentials, 0, sizeof(*credentials));
+    memset(s_active_server_leaf_sha256, 0, sizeof(s_active_server_leaf_sha256));
+    if (known_leaf_sha256 != NULL) {
+        snprintf(s_active_server_leaf_sha256, sizeof(s_active_server_leaf_sha256), "%s", known_leaf_sha256);
+    }
+    ESP_LOGW(TAG, "mTLS management console restored on TCP/%u; server credential=%s; client certificate required",
+             APP_WEB_CONSOLE_PORT, tls_source_name(source));
+    return ESP_OK;
+}
+
 static void tls_transition_task(void *arg)
 {
     const web_tls_source_t target = (web_tls_source_t)(uintptr_t)arg;
+    const bool automatic_transition = s_tls_transition_automatic;
+    const web_tls_source_t previous_source = s_tls_source;
+    acme_tls_credentials_t previous_credentials;
+    char previous_leaf_sha256[65];
+    char automatic_target_leaf_sha256[65];
+    memset(automatic_target_leaf_sha256, 0, sizeof(automatic_target_leaf_sha256));
+    if (automatic_transition) {
+        acme_tls_activation_intent_record_t intent_snapshot;
+        if (acme_client_load_tls_activation_intent(&intent_snapshot) == ESP_OK && intent_snapshot.pending)
+            snprintf(automatic_target_leaf_sha256, sizeof(automatic_target_leaf_sha256), "%s",
+                     intent_snapshot.target_leaf_sha256);
+    }
+    memset(&previous_credentials, 0, sizeof(previous_credentials));
+    snprintf(previous_leaf_sha256, sizeof(previous_leaf_sha256), "%s", s_active_server_leaf_sha256);
+
     vTaskDelay(pdMS_TO_TICKS(750));
 
+    if (previous_source != WEB_TLS_EMBEDDED) {
+        previous_credentials = s_active_stored_credentials;
+        memset(&s_active_stored_credentials, 0, sizeof(s_active_stored_credentials));
+    }
     if (s_server != NULL) {
         (void)httpd_ssl_stop(s_server);
         s_server = NULL;
         s_started = false;
     }
-    if (s_tls_source != WEB_TLS_EMBEDDED) {
-        acme_client_free_tls_credentials(&s_active_stored_credentials);
+    memset(s_active_server_leaf_sha256, 0, sizeof(s_active_server_leaf_sha256));
+
+    esp_err_t err = start_https_server(target);
+    if (err == ESP_OK) {
+        if (target == WEB_TLS_PRODUCTION) {
+            err = acme_client_set_production_boot_selected(true);
+        } else if (target == WEB_TLS_EMBEDDED) {
+            err = acme_client_set_production_boot_selected(false);
+        }
     }
 
-    esp_err_t err;
-    if (target == WEB_TLS_EMBEDDED) {
-        const esp_err_t pref_err = acme_client_set_production_boot_selected(false);
-        if (pref_err != ESP_OK) ESP_LOGE(TAG, "Could not persist embedded TLS selection: %s", esp_err_to_name(pref_err));
-        err = start_https_server(WEB_TLS_EMBEDDED);
-    } else {
-        err = start_https_server(target);
-        if (err == ESP_OK && target == WEB_TLS_PRODUCTION) {
-            err = acme_client_set_production_boot_selected(true);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "Could not persist production TLS selection: %s; rolling back", esp_err_to_name(err));
-                if (s_server != NULL) { (void)httpd_ssl_stop(s_server); s_server = NULL; s_started = false; }
-                acme_client_free_tls_credentials(&s_active_stored_credentials);
-                (void)acme_client_set_production_boot_selected(false);
+    if (err == ESP_OK) {
+        acme_client_free_tls_credentials(&previous_credentials);
+        if (target == WEB_TLS_PRODUCTION && s_active_server_leaf_sha256[0] != '\0') {
+            acme_tls_activation_intent_record_t intent;
+            const esp_err_t intent_load_err = acme_client_load_tls_activation_intent(&intent);
+            if (intent_load_err == ESP_OK && intent.pending &&
+                intent.target_leaf_sha256[0] != '\0' &&
+                strcmp(intent.target_leaf_sha256, s_active_server_leaf_sha256) == 0) {
+                const esp_err_t clear_err = tls_activation_intent_clear(false);
+                if (clear_err == ESP_OK) {
+                    portENTER_CRITICAL(&s_renewal_scheduler_lock);
+                    snprintf(s_renewal_scheduler_status.tls_activation_reconciliation_result,
+                             sizeof(s_renewal_scheduler_status.tls_activation_reconciliation_result),
+                             "activated_runtime");
+                    portEXIT_CRITICAL(&s_renewal_scheduler_lock);
+                } else {
+                    ESP_LOGE(TAG, "TLS handoff succeeded but activation-intent clear failed: %s",
+                             esp_err_to_name(clear_err));
+                }
             }
         }
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Stored TLS activation failed: %s; rolling back to embedded credential", esp_err_to_name(err));
+        if (target == WEB_TLS_PRODUCTION && automatic_transition) {
+            const esp_err_t outcome_err = tls_activation_outcome_store(true, false, ESP_OK,
+                                                                       automatic_target_leaf_sha256,
+                                                                       s_active_server_leaf_sha256);
+            if (outcome_err != ESP_OK)
+                ESP_LOGE(TAG, "TLS activation succeeded but outcome persistence failed: %s", esp_err_to_name(outcome_err));
+        }
+        ESP_LOGI(TAG, "TLS transition completed: %s -> %s",
+                 tls_source_name(previous_source), tls_source_name(target));
+    } else {
+        ESP_LOGE(TAG, "TLS transition to %s failed: %s; restoring last-known-good %s credential",
+                 tls_source_name(target), esp_err_to_name(err), tls_source_name(previous_source));
+
+        if (s_server != NULL) {
+            (void)httpd_ssl_stop(s_server);
+            s_server = NULL;
+            s_started = false;
+        }
+        if (s_tls_source != WEB_TLS_EMBEDDED) {
+            acme_client_free_tls_credentials(&s_active_stored_credentials);
+        }
+        memset(s_active_server_leaf_sha256, 0, sizeof(s_active_server_leaf_sha256));
+
+        esp_err_t rollback_err;
+        if (previous_source == WEB_TLS_EMBEDDED) {
+            rollback_err = start_https_server(WEB_TLS_EMBEDDED);
+        } else {
+            rollback_err = start_https_server_with_credentials(previous_source,
+                                                               &previous_credentials,
+                                                               previous_leaf_sha256);
+        }
+
+        if (rollback_err == ESP_OK) {
+            const bool previous_production = previous_source == WEB_TLS_PRODUCTION;
+            const esp_err_t pref_err = acme_client_set_production_boot_selected(previous_production);
+            if (pref_err != ESP_OK) {
+                ESP_LOGE(TAG, "Last-known-good TLS restored but boot preference restore failed: %s",
+                         esp_err_to_name(pref_err));
+            }
+        } else {
+            ESP_LOGE(TAG, "Last-known-good TLS restore failed: %s; attempting embedded emergency fallback",
+                     esp_err_to_name(rollback_err));
+            acme_client_free_tls_credentials(&previous_credentials);
             (void)acme_client_set_production_boot_selected(false);
-            err = start_https_server(WEB_TLS_EMBEDDED);
+            rollback_err = start_https_server(WEB_TLS_EMBEDDED);
+            if (rollback_err != ESP_OK) {
+                ESP_LOGE(TAG, "Management HTTPS emergency fallback failed: %s", esp_err_to_name(rollback_err));
+            }
+        }
+        if (target == WEB_TLS_PRODUCTION && automatic_transition) {
+            const bool lkg_restored = rollback_err == ESP_OK;
+            const esp_err_t outcome_err = tls_activation_outcome_store(false, lkg_restored, err,
+                                                                       automatic_target_leaf_sha256, s_active_server_leaf_sha256);
+            if (outcome_err != ESP_OK)
+                ESP_LOGE(TAG, "TLS activation failure outcome persistence failed: %s", esp_err_to_name(outcome_err));
+        }
+        acme_tls_activation_intent_record_t failed_intent;
+        if (acme_client_load_tls_activation_intent(&failed_intent) == ESP_OK && failed_intent.pending) {
+            portENTER_CRITICAL(&s_renewal_scheduler_lock);
+            snprintf(s_renewal_scheduler_status.tls_activation_reconciliation_result,
+                     sizeof(s_renewal_scheduler_status.tls_activation_reconciliation_result),
+                     "activation_failed_lkg_restored");
+            portEXIT_CRITICAL(&s_renewal_scheduler_lock);
         }
     }
-    if (err != ESP_OK) ESP_LOGE(TAG, "Management HTTPS restart failed: %s", esp_err_to_name(err));
-    s_tls_transition_pending = false;
+
+    if (automatic_transition) s_tls_transition_automatic = false;
+    tls_transition_release();
     vTaskDelete(NULL);
 }
 

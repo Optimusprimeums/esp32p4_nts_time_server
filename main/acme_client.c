@@ -2638,3 +2638,49 @@ esp_err_t acme_client_store_renewal_attempt_record(const acme_renewal_attempt_re
     nvs_close(handle);
     return err;
 }
+
+
+esp_err_t acme_client_load_tls_activation_intent(acme_tls_activation_intent_record_t *out_record)
+{
+    if (out_record == NULL) return ESP_ERR_INVALID_ARG;
+    memset(out_record, 0, sizeof(*out_record));
+    out_record->version = ACME_TLS_ACTIVATION_INTENT_RECORD_VERSION;
+    esp_err_t err = acme_storage_init();
+    if (err != ESP_OK) return err;
+    nvs_handle_t handle;
+    err = nvs_open_from_partition("nvs_certs", "acme", NVS_READONLY, &handle);
+    if (err != ESP_OK) return err;
+    size_t length = sizeof(*out_record);
+    err = nvs_get_blob(handle, "tls_act", out_record, &length);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        memset(out_record, 0, sizeof(*out_record));
+        out_record->version = ACME_TLS_ACTIVATION_INTENT_RECORD_VERSION;
+        return ESP_OK;
+    }
+    if (err != ESP_OK) return err;
+    if (length != sizeof(*out_record) ||
+        out_record->version != ACME_TLS_ACTIVATION_INTENT_RECORD_VERSION) {
+        return ESP_ERR_INVALID_VERSION;
+    }
+    out_record->previous_leaf_sha256[64] = '\0';
+    out_record->target_leaf_sha256[64] = '\0';
+    return ESP_OK;
+}
+
+esp_err_t acme_client_store_tls_activation_intent(const acme_tls_activation_intent_record_t *record)
+{
+    if (record == NULL || record->version != ACME_TLS_ACTIVATION_INTENT_RECORD_VERSION)
+        return ESP_ERR_INVALID_ARG;
+    if (record->previous_leaf_sha256[64] != '\0' || record->target_leaf_sha256[64] != '\0')
+        return ESP_ERR_INVALID_ARG;
+    esp_err_t err = acme_storage_init();
+    if (err != ESP_OK) return err;
+    nvs_handle_t handle;
+    err = nvs_open_from_partition("nvs_certs", "acme", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_blob(handle, "tls_act", record, sizeof(*record));
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return err;
+}

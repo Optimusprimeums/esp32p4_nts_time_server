@@ -228,6 +228,19 @@ typedef struct {
 esp_err_t acme_client_load_renewal_attempt_record(acme_renewal_attempt_record_t *out_record);
 esp_err_t acme_client_store_renewal_attempt_record(const acme_renewal_attempt_record_t *record);
 
+#define ACME_TLS_ACTIVATION_INTENT_RECORD_VERSION 1U
+typedef struct {
+    uint32_t version;
+    bool pending;
+    bool boot_reconciled;
+    int64_t created_unix;
+    char previous_leaf_sha256[65];
+    char target_leaf_sha256[65];
+} acme_tls_activation_intent_record_t;
+
+esp_err_t acme_client_load_tls_activation_intent(acme_tls_activation_intent_record_t *out_record);
+esp_err_t acme_client_store_tls_activation_intent(const acme_tls_activation_intent_record_t *record);
+
 /*
  * Run one complete production issuance/replacement transaction using the
  * existing protected account identity and dual-slot production store.
