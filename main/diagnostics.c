@@ -146,6 +146,40 @@ static void diagnostics_task(void *arg)
             ntp_status.advertised_leap_indicator,
             ntp_status.advertised_root_dispersion);
 
+        if (ntp_status.timing_samples > 0U) {
+            ESP_LOGI(
+                TAG,
+                "ntp-timing: n=%" PRIu32
+                " rx_start=%" PRIu32 "/%" PRIu32 "/%" PRIu32
+                " us rx_clock=%" PRIu32 "/%" PRIu32 "/%" PRIu32
+                " us build=%" PRIu32 "/%" PRIu32 "/%" PRIu32 " us",
+                ntp_status.timing_samples,
+                ntp_status.rx_timestamp_start_min_us,
+                ntp_status.rx_timestamp_start_avg_us,
+                ntp_status.rx_timestamp_start_max_us,
+                ntp_status.rx_timestamp_call_min_us,
+                ntp_status.rx_timestamp_call_avg_us,
+                ntp_status.rx_timestamp_call_max_us,
+                ntp_status.response_build_min_us,
+                ntp_status.response_build_avg_us,
+                ntp_status.response_build_max_us);
+
+            ESP_LOGI(
+                TAG,
+                "ntp-timing: tx_to_send=%" PRIu32 "/%" PRIu32 "/%" PRIu32
+                " us send=%" PRIu32 "/%" PRIu32 "/%" PRIu32
+                " us total=%" PRIu32 "/%" PRIu32 "/%" PRIu32 " us",
+                ntp_status.tx_timestamp_to_send_min_us,
+                ntp_status.tx_timestamp_to_send_avg_us,
+                ntp_status.tx_timestamp_to_send_max_us,
+                ntp_status.send_call_min_us,
+                ntp_status.send_call_avg_us,
+                ntp_status.send_call_max_us,
+                ntp_status.total_response_min_us,
+                ntp_status.total_response_avg_us,
+                ntp_status.total_response_max_us);
+        }
+
         vTaskDelay(pdMS_TO_TICKS(5000U));
     }
 }

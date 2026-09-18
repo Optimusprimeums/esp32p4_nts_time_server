@@ -29,6 +29,10 @@ typedef struct {
     uint32_t rejected_samples;
     uint32_t holdover_seconds;
     uint32_t root_dispersion_16_16;
+
+    bool reference_timestamp_valid;
+    int64_t reference_utc_seconds;
+    uint32_t reference_age_seconds;
 } clock_discipline_status_t;
 
 esp_err_t clock_discipline_init(void);
@@ -43,6 +47,14 @@ esp_err_t clock_discipline_submit_sample(uint64_t pps_capture_us,
                                          app_leap_indicator_t leap_indicator);
 
 bool clock_discipline_get_ntp_timestamp(clock_ntp_timestamp_t *out_timestamp);
+
+/*
+ * Returns the UTC/NTP timestamp of the most recently accepted PPS/GNSS
+ * reference event. The value remains fixed during holdover.
+ */
+bool clock_discipline_get_reference_timestamp(
+    clock_ntp_timestamp_t *out_timestamp,
+    uint32_t *out_age_seconds);
 
 bool clock_discipline_get_status(clock_discipline_status_t *out_status);
 
