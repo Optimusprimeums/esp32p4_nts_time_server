@@ -12,6 +12,7 @@
 #include "ntp_packet.h"
 #include "ntp_rate_limit.h"
 #include "ntp_types.h"
+#include "nts_ntp_auth.h"
 
 #include "esp_err.h"
 #include "esp_log.h"
@@ -33,6 +34,9 @@ static const char *TAG = "NTP";
 static bool s_started;
 static portMUX_TYPE s_ntp_lock = portMUX_INITIALIZER_UNLOCKED;
 static ntp_server_status_t s_status;
+
+static uint8_t s_request_buffer[NTS_NTP_MAX_PACKET_SIZE];
+static uint8_t s_response_buffer[NTS_NTP_MAX_PACKET_SIZE];
 
 
 typedef struct {
@@ -450,9 +454,9 @@ static bool build_server_response(const ntp_packet_fields_t *request,
     ntp_timestamp_t transmit_timestamp;
 
     if (!get_reference_ntp_timestamp(&reference_timestamp) ||
-        !get_current_ntp_timestamp(&transmit_timestamp)) {
-        return false;
-    }
+    !get_current_ntp_timestamp(&transmit_timestamp)) {
+    return false;
+}
 
     if (out_tx_timestamp_complete_us != NULL) {
         *out_tx_timestamp_complete_us = esp_timer_get_time();
@@ -545,9 +549,6 @@ static void ntp_server_task(void *arg)
 {
     (void)arg;
 
-    uint8_t request_buffer[256];
-    uint8_t response_buffer[NTP_PACKET_SIZE];
-
     while (true) {
         const int socket_fd = ntp_server_open_socket();
 
@@ -572,8 +573,8 @@ static void ntp_server_task(void *arg)
 
             const int received = recvfrom(
                 socket_fd,
-                request_buffer,
-                sizeof(request_buffer),
+                s_request_buffer,
+                sizeof(s_request_buffer),
                 0,
                 (struct sockaddr *)&client_address,
                 &client_length);
@@ -597,10 +598,19 @@ static void ntp_server_task(void *arg)
 
             ntp_packet_fields_t request;
 
-            if (!ntp_packet_parse(request_buffer,
+            if (!ntp_packet_parse(s_request_buffer,
                                   (size_t)received,
                                   &request) ||
                 !valid_client_request(&request)) {
+                ntp_status_record_invalid_request();
+                continue;
+            }
+
+            const bool nts_request = nts_ntp_auth_request_present(
+                s_request_buffer,
+                (size_t)received);
+
+            if (nts_request && request.version != NTP_VERSION_4) {
                 ntp_status_record_invalid_request();
                 continue;
             }
@@ -609,18 +619,18 @@ static void ntp_server_task(void *arg)
 
             if (!ntp_rate_limit_allow(client_address.sin_addr.s_addr,
                                       &send_kod)) {
-                if (send_kod) {
-                    build_rate_kod(&request, response_buffer);
+                if (send_kod && !nts_request) {
+                    build_rate_kod(&request, s_response_buffer);
 
                     const int sent = sendto(
                         socket_fd,
-                        response_buffer,
-                        sizeof(response_buffer),
+                        s_response_buffer,
+                        NTP_PACKET_SIZE,
                         0,
                         (const struct sockaddr *)&client_address,
                         client_length);
 
-                    if (sent == (int)sizeof(response_buffer)) {
+                    if (sent == (int)NTP_PACKET_SIZE) {
                         ntp_status_record_kod();
                     } else {
                         ntp_status_record_send_failure();
@@ -630,10 +640,30 @@ static void ntp_server_task(void *arg)
                 continue;
             }
 
+            nts_ntp_auth_context_t nts_context;
+            memset(&nts_context, 0, sizeof(nts_context));
+
+            if (nts_request) {
+                const esp_err_t nts_err = nts_ntp_auth_verify_request(
+                    s_request_buffer,
+                    (size_t)received,
+                    &nts_context);
+
+                if (nts_err != ESP_OK) {
+                    ESP_LOGW(TAG,
+                             "NTS request authentication failed: %s",
+                             esp_err_to_name(nts_err));
+                    nts_ntp_auth_clear_context(&nts_context);
+                    ntp_status_record_invalid_request();
+                    continue;
+                }
+            }
+
             ntp_timestamp_t software_receive_timestamp;
             const int64_t timing_rx_start_us = esp_timer_get_time();
 
             if (!get_current_ntp_timestamp(&software_receive_timestamp)) {
+                nts_ntp_auth_clear_context(&nts_context);
                 ntp_status_record_unsynchronized_drop();
                 continue;
             }
@@ -646,6 +676,7 @@ static void ntp_server_task(void *arg)
              * software timestamp: missing/mismatched/stale mapping fails
              * closed for that request. */
             if (!hw_rx_available) {
+                nts_ntp_auth_clear_context(&nts_context);
                 ntp_status_record_hw_rx_authority_drop();
                 ESP_LOGW(TAG, "HW RX authority unavailable; dropping NTP request");
                 continue;
@@ -669,29 +700,54 @@ static void ntp_server_task(void *arg)
 
             if (!build_server_response(&request,
                                        receive_timestamp,
-                                       response_buffer,
+                                       s_response_buffer,
                                        &stratum,
                                        &leap,
                                        &dispersion,
                                        &timing_tx_complete_us,
                                        &timing_packet_built_us)) {
+                nts_ntp_auth_clear_context(&nts_context);
                 ntp_status_record_unsynchronized_drop();
                 continue;
             }
+
+            size_t response_length = NTP_PACKET_SIZE;
+
+            if (nts_request) {
+                const esp_err_t nts_err = nts_ntp_auth_protect_response(
+                    &nts_context,
+                    s_response_buffer,
+                    NTP_PACKET_SIZE,
+                    sizeof(s_response_buffer),
+                    &response_length);
+
+                if (nts_err != ESP_OK) {
+                    ESP_LOGW(TAG,
+                             "NTS response protection failed: %s",
+                             esp_err_to_name(nts_err));
+                    nts_ntp_auth_clear_context(&nts_context);
+                    ntp_status_record_send_failure();
+                    continue;
+                }
+
+                timing_packet_built_us = esp_timer_get_time();
+            }
+
+            nts_ntp_auth_clear_context(&nts_context);
 
             const int64_t timing_send_start_us = esp_timer_get_time();
 
             const int sent = sendto(
                 socket_fd,
-                response_buffer,
-                sizeof(response_buffer),
+                s_response_buffer,
+                response_length,
                 0,
                 (const struct sockaddr *)&client_address,
                 client_length);
 
             const int64_t timing_send_complete_us = esp_timer_get_time();
 
-            if (sent == (int)sizeof(response_buffer)) {
+            if (sent == (int)response_length) {
                 ntp_status_record_timing(
                     clamp_duration_us(timing_recv_return_us, timing_rx_start_us),
                     clamp_duration_us(timing_rx_start_us, timing_rx_complete_us),

@@ -14,6 +14,11 @@ idf_component_register(
         "ntp_packet.c"
         "ntp_rate_limit.c"
         "ntp_server.c"
+        "nts_aes_siv.c"
+        "nts_storage.c"
+        "nts_cookie.c"
+        "nts_ntp_auth.c"
+        "nts_ke.c"
         "web_console.c"
 
     INCLUDE_DIRS

@@ -5,6 +5,7 @@
 #include "eth_service.h"
 #include "gnss_service.h"
 #include "ntp_server.h"
+#include "nts_ke.h"
 #include "pps_service.h"
 #include "web_console.h"
 
@@ -140,6 +141,19 @@ void app_main(void)
                  esp_err_to_name(err));
     }
 
+    err = nts_ke_start();
+
+    if (err != ESP_OK) {
+        /*
+         * NTS-KE is an authentication/key-establishment service and is not
+         * part of the authoritative timing path. Keep conventional NTP and
+         * management services operational if NTS-KE cannot start.
+         */
+        ESP_LOGW(TAG,
+                 "NTS-KE server did not start: %s",
+                 esp_err_to_name(err));
+    }
+
     ESP_LOGI(TAG,
-             "Ethernet, NTP, and read-only HTTPS management console started");
+             "Ethernet, NTP, NTS-KE, and HTTPS management services started");
 }

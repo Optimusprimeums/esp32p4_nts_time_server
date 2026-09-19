@@ -2,9 +2,9 @@
 
 #include <string.h>
 
-#include "app_state.h"
-#include "key_store.h"
+#include "clock_discipline.h"
 #include "nts_aes_siv.h"
+#include "nts_storage.h"
 
 #include "esp_random.h"
 
@@ -76,24 +76,32 @@ static uint64_t read_u64_be(
     return value;
 }
 
-static uint64_t current_ntp_seconds(void)
+static bool current_ntp_seconds(uint32_t *out_seconds)
 {
-    ntp_timestamp_t timestamp;
+    if (out_seconds == NULL) {
+        return false;
+    }
 
-    app_state_get_ntp_timestamp(&timestamp);
+    clock_ntp_timestamp_t timestamp;
 
-    return timestamp.seconds;
+    if (!clock_discipline_get_ntp_timestamp(&timestamp)) {
+        return false;
+    }
+
+    *out_seconds = timestamp.seconds;
+
+    return true;
 }
 
-static const key_store_cookie_key_t *
+static const nts_storage_cookie_key_t *
 find_cookie_master_key(
-    const key_store_cookie_keyring_t *keyring,
+    const nts_storage_cookie_keyring_t *keyring,
     uint32_t key_id)
 {
     for (size_t i = 0;
-         i < KEY_STORE_COOKIE_KEY_SLOTS;
+         i < NTS_STORAGE_COOKIE_KEY_SLOTS;
          i++) {
-        const key_store_cookie_key_t *key =
+        const nts_storage_cookie_key_t *key =
             &keyring->slots[i];
 
         if (key->valid != 0U &&
@@ -105,13 +113,13 @@ find_cookie_master_key(
     return NULL;
 }
 
-static const key_store_cookie_key_t *
+static const nts_storage_cookie_key_t *
 get_active_cookie_master_key(
-    const key_store_cookie_keyring_t *keyring)
+    const nts_storage_cookie_keyring_t *keyring)
 {
-    const key_store_cookie_key_t *active =
+    const nts_storage_cookie_key_t *active =
         &keyring->slots[
-            KEY_STORE_SLOT_ACTIVE];
+            NTS_STORAGE_SLOT_ACTIVE];
 
     if (active->valid == 0U) {
         return NULL;
@@ -129,30 +137,42 @@ esp_err_t nts_cookie_generate_keys(
         return ESP_ERR_INVALID_ARG;
     }
 
-    key_store_cookie_keyring_t keyring;
-
     esp_err_t err =
-        key_store_load_cookie_keyring(
-            &keyring);
+        nts_storage_maintain_cookie_keyring();
 
     if (err != ESP_OK) {
         return err;
     }
 
-    const key_store_cookie_key_t *active =
+    nts_storage_cookie_keyring_t keyring;
+
+    err = nts_storage_load_cookie_keyring(
+        &keyring);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    const nts_storage_cookie_key_t *active =
         get_active_cookie_master_key(
             &keyring);
 
     if (active == NULL) {
-        key_store_zeroize(
+        nts_storage_zeroize(
             &keyring,
             sizeof(keyring));
 
         return ESP_ERR_NOT_FOUND;
     }
 
-    uint64_t now_ntp =
-        current_ntp_seconds();
+    uint32_t now_ntp_seconds = 0U;
+
+    if (!current_ntp_seconds(&now_ntp_seconds)) {
+    nts_storage_zeroize(keys, sizeof(*keys));
+    return ESP_ERR_INVALID_STATE;
+    }
+
+uint64_t now_ntp = (uint64_t)now_ntp_seconds;
 
     memset(keys, 0, sizeof(*keys));
 
@@ -173,7 +193,7 @@ esp_err_t nts_cookie_generate_keys(
     keys->expires_ntp_seconds =
         now_ntp + lifetime_seconds;
 
-    key_store_zeroize(
+    nts_storage_zeroize(
         &keyring,
         sizeof(keyring));
 
@@ -191,22 +211,28 @@ esp_err_t nts_cookie_create(
         return ESP_ERR_INVALID_ARG;
     }
 
-    key_store_cookie_keyring_t keyring;
-
     esp_err_t err =
-        key_store_load_cookie_keyring(
-            &keyring);
+        nts_storage_maintain_cookie_keyring();
 
     if (err != ESP_OK) {
         return err;
     }
 
-    const key_store_cookie_key_t *master =
+    nts_storage_cookie_keyring_t keyring;
+
+    err = nts_storage_load_cookie_keyring(
+        &keyring);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    const nts_storage_cookie_key_t *master =
         get_active_cookie_master_key(
             &keyring);
 
     if (master == NULL) {
-        key_store_zeroize(
+        nts_storage_zeroize(
             &keyring,
             sizeof(keyring));
 
@@ -224,7 +250,7 @@ esp_err_t nts_cookie_create(
     if (*cookie_len < required_len) {
         *cookie_len = required_len;
 
-        key_store_zeroize(
+        nts_storage_zeroize(
             &keyring,
             sizeof(keyring));
 
@@ -279,11 +305,11 @@ esp_err_t nts_cookie_create(
     offset += NTS_TRAFFIC_KEY_LEN;
 
     if (offset != sizeof(plaintext)) {
-        key_store_zeroize(
+        nts_storage_zeroize(
             plaintext,
             sizeof(plaintext));
 
-        key_store_zeroize(
+        nts_storage_zeroize(
             &keyring,
             sizeof(keyring));
 
@@ -312,16 +338,16 @@ esp_err_t nts_cookie_create(
         &cookie[NTS_COOKIE_WIRE_PREFIX_LEN],
         &output_len);
 
-    key_store_zeroize(
+    nts_storage_zeroize(
         plaintext,
         sizeof(plaintext));
 
-    key_store_zeroize(
+    nts_storage_zeroize(
         &keyring,
         sizeof(keyring));
 
     if (err != ESP_OK) {
-        key_store_zeroize(
+        nts_storage_zeroize(
             cookie,
             required_len);
 
@@ -367,23 +393,29 @@ esp_err_t nts_cookie_unpack(
         cookie_len -
         NTS_COOKIE_WIRE_PREFIX_LEN;
 
-    key_store_cookie_keyring_t keyring;
-
     esp_err_t err =
-        key_store_load_cookie_keyring(
-            &keyring);
+        nts_storage_maintain_cookie_keyring();
 
     if (err != ESP_OK) {
         return err;
     }
 
-    const key_store_cookie_key_t *master =
+    nts_storage_cookie_keyring_t keyring;
+
+    err = nts_storage_load_cookie_keyring(
+        &keyring);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    const nts_storage_cookie_key_t *master =
         find_cookie_master_key(
             &keyring,
             master_key_id);
 
     if (master == NULL) {
-        key_store_zeroize(
+        nts_storage_zeroize(
             &keyring,
             sizeof(keyring));
 
@@ -406,12 +438,12 @@ esp_err_t nts_cookie_unpack(
         plaintext,
         &plaintext_len);
 
-    key_store_zeroize(
+    nts_storage_zeroize(
         &keyring,
         sizeof(keyring));
 
     if (err != ESP_OK) {
-        key_store_zeroize(
+        nts_storage_zeroize(
             plaintext,
             sizeof(plaintext));
 
@@ -420,7 +452,7 @@ esp_err_t nts_cookie_unpack(
 
     if (plaintext_len !=
         NTS_COOKIE_PLAINTEXT_LEN) {
-        key_store_zeroize(
+        nts_storage_zeroize(
             plaintext,
             sizeof(plaintext));
 
@@ -458,19 +490,29 @@ esp_err_t nts_cookie_unpack(
         reserved != 0U ||
         payload_master_key_id !=
             master_key_id) {
-        key_store_zeroize(
+        nts_storage_zeroize(
             plaintext,
             sizeof(plaintext));
 
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    uint64_t now_ntp =
-        current_ntp_seconds();
+    uint32_t now_ntp_seconds = 0U;
+
+    if (!current_ntp_seconds(&now_ntp_seconds)) {
+    nts_storage_zeroize(
+        plaintext,
+        sizeof(plaintext));
+
+    return ESP_ERR_INVALID_STATE;
+    }
+
+    const uint64_t now_ntp =
+    (uint64_t)now_ntp_seconds;
 
     if (expires_ntp_seconds <= now_ntp ||
         issued_ntp_seconds > now_ntp) {
-        key_store_zeroize(
+        nts_storage_zeroize(
             plaintext,
             sizeof(plaintext));
 
@@ -498,13 +540,13 @@ esp_err_t nts_cookie_unpack(
            NTS_TRAFFIC_KEY_LEN);
     offset += NTS_TRAFFIC_KEY_LEN;
 
-    key_store_zeroize(
+    nts_storage_zeroize(
         plaintext,
         sizeof(plaintext));
 
     if (offset !=
         NTS_COOKIE_PLAINTEXT_LEN) {
-        key_store_zeroize(
+        nts_storage_zeroize(
             keys,
             sizeof(*keys));
 
