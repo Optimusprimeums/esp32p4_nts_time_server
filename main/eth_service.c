@@ -26,6 +26,7 @@ static const char *TAG = "ETH";
 
 #define ETH_IP_READY_BIT                         BIT0
 #define ETH_PTP_CORRELATION_PERIOD_MS             10000U
+#define ETH_PTP_CORRELATION_ACQUIRE_PERIOD_MS      1000U
 #define ETH_PTP_CORRELATION_INITIAL_DELAY_MS       5000U
 #define ETHERTYPE_IPV4                              0x0800U
 #define ETHERTYPE_VLAN                              0x8100U
@@ -844,7 +845,19 @@ static void eth_ptp_correlation_task(void *arg)
 
     while (true) {
         eth_ptp_correlation_sample();
-        vTaskDelay(pdMS_TO_TICKS(ETH_PTP_CORRELATION_PERIOD_MS));
+
+        uint32_t correlation_samples = 0U;
+
+        portENTER_CRITICAL(&s_eth_lock);
+        correlation_samples = s_status.ptp_correlation_samples;
+        portEXIT_CRITICAL(&s_eth_lock);
+
+        const uint32_t delay_ms =
+            (correlation_samples < 2U)
+                ? ETH_PTP_CORRELATION_ACQUIRE_PERIOD_MS
+                : ETH_PTP_CORRELATION_PERIOD_MS;
+
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
 }
 #endif
