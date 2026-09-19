@@ -18,41 +18,21 @@ an authenticated HTTPS management plane.
 
 ## Platform
 
-  -----------------------------------------------------------------------
-  Item                                Configuration
-  ----------------------------------- -----------------------------------
-  MCU                                 ESP32-P4
-
-  ESP-IDF                             v6.1.0
-
-  Host                                Windows 11 / Espressif Installation
-                                      Manager
-
-  Flash                               16 MB
-
-  PSRAM                               32 MB
-
-  GNSS                                u-blox LEA-M8T
-
-  Ethernet PHY                        IP101
-
-  Secure Boot                         **Disabled by project policy**
-
-  Flash encryption                    Enabled on the provisioned target,
-                                      Development Mode
-
-  Management                          HTTPS on TCP/443 with mandatory
-                                      mTLS
-
-  NTP                                 UDP/123, NTP versions 1-4 client
-                                      requests
-
-  Ethernet timing                     ESP32-P4 EMAC PTP hardware RX/TX
-                                      timestamp support integrated
-
-  LP core                             Experimental observer/proof track
-                                      only
-  -----------------------------------------------------------------------
+| Item | Configuration |
+|---|---|
+| MCU | ESP32-P4 |
+| ESP-IDF | v6.1.0 |
+| Host | Windows 11 / Espressif Installation Manager |
+| Flash | 16 MB |
+| PSRAM | 32 MB |
+| GNSS | u-blox LEA-M8T |
+| Ethernet PHY | IP101 |
+| Secure Boot | **Disabled by project policy** |
+| Flash encryption | Enabled on the provisioned target, Development Mode |
+| Management | HTTPS on TCP/443 with mandatory mTLS |
+| NTP | UDP/123, NTP versions 1-4 client requests |
+| Ethernet timing | ESP32-P4 EMAC PTP hardware RX/TX timestamp support integrated |
+| LP core | Experimental observer/proof track only |
 
 ### Validated pin assignments
 
