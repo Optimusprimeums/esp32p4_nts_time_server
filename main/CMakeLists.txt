@@ -15,6 +15,7 @@ idf_component_register(
         "ntp_rate_limit.c"
         "ntp_server.c"
         "web_console.c"
+        "hp_lp_test.c"
 
     INCLUDE_DIRS
         "."
@@ -38,9 +39,26 @@ idf_component_register(
         lwip
         log
         espressif__ip101
+        ulp
 
     EMBED_TXTFILES
         "servercert.pem"
         "serverkey.pem"
         "management_ca.pem"
+)
+
+set(ulp_app_name ulp_hp_lp_test)
+
+set(ulp_sources
+    "ulp/hp_lp_test_lp.c"
+)
+
+set(ulp_exp_dep_srcs
+    "hp_lp_test.c"
+)
+
+ulp_embed_binary(
+    ${ulp_app_name}
+    "${ulp_sources}"
+    "${ulp_exp_dep_srcs}"
 )

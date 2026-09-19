@@ -7,6 +7,7 @@
 #include "ntp_server.h"
 #include "pps_service.h"
 #include "web_console.h"
+#include "hp_lp_test.h"
 
 #include "esp_err.h"
 #include "esp_event.h"
@@ -68,7 +69,7 @@ void app_main(void)
 
     app_state_init();
 
-    err = device_config_init();
+   err = device_config_init();
 
     if (err != ESP_OK) {
         ESP_LOGE(TAG,
@@ -77,10 +78,28 @@ void app_main(void)
         return;
     }
 
+    err = hp_lp_test_start();
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "HP-LP test initialization failed: %s",
+                 esp_err_to_name(err));
+        return;
+    }
+
     err = pps_service_init();
 
     if (err != ESP_OK) {
         enter_fail_closed("PPS service", err);
+        return;
+    }
+
+    err = hp_lp_test_start_pps_comparison();
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG,
+                "HP-LP PPS comparison startup failed: %s",
+                esp_err_to_name(err));
         return;
     }
 
