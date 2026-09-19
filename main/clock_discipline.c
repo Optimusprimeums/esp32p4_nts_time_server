@@ -41,6 +41,10 @@ typedef struct {
     uint64_t last_sample_capture_us;
     int64_t last_sample_utc_seconds;
 
+    bool reference_timestamp_valid;
+    uint64_t reference_capture_us;
+    int64_t reference_utc_seconds;
+
     int64_t last_phase_error_ns;
     double frequency_ppm;
 
@@ -506,6 +510,10 @@ esp_err_t clock_discipline_submit_sample(uint64_t pps_capture_us,
         s_clock.last_sample_capture_us = pps_capture_us;
         s_clock.last_sample_utc_seconds = utc_seconds;
 
+        s_clock.reference_timestamp_valid = true;
+        s_clock.reference_capture_us = pps_capture_us;
+        s_clock.reference_utc_seconds = utc_seconds;
+
         s_clock.last_phase_error_ns = timing_quantization_error_ns;
         s_clock.frequency_ppm = 0.0;
 
@@ -611,6 +619,10 @@ esp_err_t clock_discipline_submit_sample(uint64_t pps_capture_us,
     s_clock.last_sample_capture_us = pps_capture_us;
     s_clock.last_sample_utc_seconds = utc_seconds;
 
+    s_clock.reference_timestamp_valid = true;
+    s_clock.reference_capture_us = pps_capture_us;
+    s_clock.reference_utc_seconds = utc_seconds;
+
     s_clock.last_phase_error_ns = phase_error_ns;
     s_clock.leap_indicator = leap_indicator;
 
@@ -682,6 +694,53 @@ bool clock_discipline_get_ntp_timestamp(clock_ntp_timestamp_t *out_timestamp)
     return true;
 }
 
+bool clock_discipline_get_reference_timestamp(
+    clock_ntp_timestamp_t *out_timestamp,
+    uint32_t *out_age_seconds)
+{
+    if (out_timestamp == NULL || !s_clock.initialized) {
+        return false;
+    }
+
+    if (!lock_clock()) {
+        return false;
+    }
+
+    if (!s_clock.solution_valid ||
+        !s_clock.reference_timestamp_valid ||
+        (s_clock.state != APP_CLOCK_SYNCHRONIZED &&
+         s_clock.state != APP_CLOCK_HOLDOVER) ||
+        s_clock.reference_utc_seconds <= 0) {
+        unlock_clock();
+        return false;
+    }
+
+    uint64_t now_capture_us = s_clock.reference_capture_us;
+
+    if (!pps_service_get_monotonic_us(&now_capture_us) ||
+        now_capture_us < s_clock.reference_capture_us) {
+        unlock_clock();
+        return false;
+    }
+
+    out_timestamp->seconds =
+        (uint32_t)((uint64_t)s_clock.reference_utc_seconds +
+                   APP_NTP_EPOCH_DELTA);
+    out_timestamp->fraction = 0U;
+
+    if (out_age_seconds != NULL) {
+        const uint64_t age_seconds =
+            (now_capture_us - s_clock.reference_capture_us) / 1000000ULL;
+
+        *out_age_seconds = age_seconds > UINT32_MAX
+                               ? UINT32_MAX
+                               : (uint32_t)age_seconds;
+    }
+
+    unlock_clock();
+    return true;
+}
+
 bool clock_discipline_get_status(clock_discipline_status_t *out_status)
 {
     if (out_status == NULL || !s_clock.initialized) {
@@ -709,6 +768,25 @@ bool clock_discipline_get_status(clock_discipline_status_t *out_status)
     out_status->holdover_seconds = holdover_seconds;
     out_status->root_dispersion_16_16 =
         calculate_dispersion_16_16_locked(holdover_seconds);
+    out_status->reference_timestamp_valid =
+        s_clock.reference_timestamp_valid &&
+        s_clock.solution_valid &&
+        (s_clock.state == APP_CLOCK_SYNCHRONIZED ||
+         s_clock.state == APP_CLOCK_HOLDOVER);
+    out_status->reference_utc_seconds = s_clock.reference_utc_seconds;
+
+    if (out_status->reference_timestamp_valid &&
+        now_capture_us >= s_clock.reference_capture_us) {
+        const uint64_t reference_age_seconds =
+            (now_capture_us - s_clock.reference_capture_us) / 1000000ULL;
+
+        out_status->reference_age_seconds =
+            reference_age_seconds > UINT32_MAX
+                ? UINT32_MAX
+                : (uint32_t)reference_age_seconds;
+    } else {
+        out_status->reference_age_seconds = 0U;
+    }
 
     unlock_clock();
 

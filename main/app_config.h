@@ -1,6 +1,17 @@
 #pragma once
 
 /* --------------------------------------------------------------------------
+ * Device identity
+ * -------------------------------------------------------------------------- */
+
+#ifndef CONFIG_APP_DEVICE_HOSTNAME
+#define CONFIG_APP_DEVICE_HOSTNAME               "esp32p4-ntp"
+#endif
+
+#define APP_DEVICE_HOSTNAME_DEFAULT              CONFIG_APP_DEVICE_HOSTNAME
+#define APP_DEVICE_HOSTNAME_MAX_LENGTH           63U
+
+/* --------------------------------------------------------------------------
  * Ethernet
  * -------------------------------------------------------------------------- */
 

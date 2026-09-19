@@ -30,6 +30,7 @@ static const char *TAG = "GNSS";
 #define UBX_SYNC_2                              0x62U
 
 #define UBX_CLASS_NAV                           0x01U
+#define UBX_CLASS_MON                           0x0AU
 #define UBX_CLASS_ACK                           0x05U
 #define UBX_CLASS_CFG                           0x06U
 #define UBX_CLASS_TIM                           0x0DU
@@ -42,6 +43,11 @@ static const char *TAG = "GNSS";
 #define UBX_ID_NAV_TIMELS                       0x26U
 
 #define UBX_ID_TIM_TP                           0x01U
+
+#define UBX_ID_MON_VER                          0x04U
+#define UBX_MON_VER_BASE_LENGTH                 40U
+#define UBX_MON_VER_EXTENSION_LENGTH            30U
+#define UBX_MON_VER_MAX_PAYLOAD_LENGTH          512U
 
 #define UBX_ID_CFG_MSG                          0x01U
 #define UBX_ID_CFG_TP5                          0x31U
@@ -113,7 +119,7 @@ typedef struct {
     uint8_t ck_b;
     uint8_t received_ck_a;
     uint8_t received_ck_b;
-    uint8_t payload[APP_GNSS_UBX_MAX_PAYLOAD_LENGTH];
+    uint8_t payload[UBX_MON_VER_MAX_PAYLOAD_LENGTH];
 } ubx_parser_t;
 
 static portMUX_TYPE s_gnss_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -610,6 +616,81 @@ static void handle_ubx_tim_tp(const uint8_t *payload,
     portEXIT_CRITICAL(&s_gnss_lock);
 }
 
+
+static void copy_ubx_text_field(char *dst, size_t dst_size,
+                                const uint8_t *src, size_t src_size)
+{
+    if (dst == NULL || dst_size == 0U) {
+        return;
+    }
+
+    size_t length = 0U;
+    while (length < src_size && src[length] != 0U) {
+        ++length;
+    }
+    while (length > 0U && src[length - 1U] == ' ') {
+        --length;
+    }
+
+    if (length >= dst_size) {
+        length = dst_size - 1U;
+    }
+
+    memcpy(dst, src, length);
+    dst[length] = '\0';
+}
+
+static void handle_ubx_mon_ver(const uint8_t *payload, uint16_t payload_length)
+{
+    if (payload == NULL || payload_length < UBX_MON_VER_BASE_LENGTH) {
+        portENTER_CRITICAL(&s_gnss_lock);
+        s_status.ubx_frames_invalid_length++;
+        portEXIT_CRITICAL(&s_gnss_lock);
+        return;
+    }
+
+    char software[31] = {0};
+    char hardware[11] = {0};
+    char model[32] = {0};
+
+    copy_ubx_text_field(software, sizeof(software), &payload[0], 30U);
+    copy_ubx_text_field(hardware, sizeof(hardware), &payload[30], 10U);
+
+    for (uint16_t offset = UBX_MON_VER_BASE_LENGTH;
+         offset + UBX_MON_VER_EXTENSION_LENGTH <= payload_length;
+         offset += UBX_MON_VER_EXTENSION_LENGTH) {
+        char extension[UBX_MON_VER_EXTENSION_LENGTH + 1U] = {0};
+        copy_ubx_text_field(extension, sizeof(extension),
+                            &payload[offset], UBX_MON_VER_EXTENSION_LENGTH);
+        if (strncmp(extension, "MOD=", 4U) == 0 && extension[4] != '\0') {
+            snprintf(model, sizeof(model), "%s", &extension[4]);
+            break;
+        }
+    }
+
+    /* Older M8 firmware may omit the MOD= extension. In that case expose the
+     * receiver's own HW version rather than inventing a module model. */
+    if (model[0] == '\0' && hardware[0] != '\0') {
+        snprintf(model, sizeof(model), "%s", hardware);
+    }
+
+    portENTER_CRITICAL(&s_gnss_lock);
+    snprintf(s_status.receiver_model, sizeof(s_status.receiver_model), "%s", model);
+    snprintf(s_status.receiver_software_version,
+             sizeof(s_status.receiver_software_version), "%s", software);
+    snprintf(s_status.receiver_hardware_version,
+             sizeof(s_status.receiver_hardware_version), "%s", hardware);
+    s_status.receiver_identity_valid =
+        s_status.receiver_software_version[0] != '\0' ||
+        s_status.receiver_hardware_version[0] != '\0';
+    portEXIT_CRITICAL(&s_gnss_lock);
+
+    ESP_LOGI(TAG, "UBX receiver identity: model=%s sw=%s hw=%s",
+             model[0] != '\0' ? model : "unknown",
+             software[0] != '\0' ? software : "unknown",
+             hardware[0] != '\0' ? hardware : "unknown");
+}
+
 static void dispatch_ubx_frame(uint8_t message_class,
                                uint8_t message_id,
                                const uint8_t *payload,
@@ -641,6 +722,12 @@ static void dispatch_ubx_frame(uint8_t message_class,
     if (message_class == UBX_CLASS_TIM &&
         message_id == UBX_ID_TIM_TP) {
         handle_ubx_tim_tp(payload, payload_length);
+        return;
+    }
+
+    if (message_class == UBX_CLASS_MON &&
+        message_id == UBX_ID_MON_VER) {
+        handle_ubx_mon_ver(payload, payload_length);
         return;
     }
 
@@ -691,7 +778,7 @@ static void ubx_parser_consume(uint8_t byte)
         ubx_checksum_add(byte);
 
         if (s_ubx_parser.payload_length >
-            APP_GNSS_UBX_MAX_PAYLOAD_LENGTH) {
+            UBX_MON_VER_MAX_PAYLOAD_LENGTH) {
             portENTER_CRITICAL(&s_gnss_lock);
             s_status.ubx_frames_invalid_length++;
             portEXIT_CRITICAL(&s_gnss_lock);
@@ -957,6 +1044,37 @@ static esp_err_t ubx_configure_tp1(void)
                                  sizeof(payload));
 }
 
+
+static void ubx_poll_mon_ver(void)
+{
+    const uart_port_t uart_num = (uart_port_t)APP_GNSS_UART_NUM;
+
+    if (ubx_write_frame(UBX_CLASS_MON, UBX_ID_MON_VER, NULL, 0U) != ESP_OK) {
+        ESP_LOGW(TAG, "UBX-MON-VER poll transmit failed");
+        return;
+    }
+
+    const int64_t deadline_us = esp_timer_get_time() + 750000LL;
+    while (esp_timer_get_time() < deadline_us) {
+        uint8_t receive_buffer[96];
+        const int received = uart_read_bytes(uart_num, receive_buffer,
+                                             sizeof(receive_buffer),
+                                             pdMS_TO_TICKS(25U));
+        for (int index = 0; index < received; ++index) {
+            process_received_byte(receive_buffer[index]);
+        }
+
+        portENTER_CRITICAL(&s_gnss_lock);
+        const bool identity_valid = s_status.receiver_identity_valid;
+        portEXIT_CRITICAL(&s_gnss_lock);
+        if (identity_valid) {
+            return;
+        }
+    }
+
+    ESP_LOGW(TAG, "UBX-MON-VER identity response not received");
+}
+
 static void gnss_configure_receiver(void)
 {
     portENTER_CRITICAL(&s_gnss_lock);
@@ -1195,6 +1313,9 @@ esp_err_t gnss_service_init(void)
     } else {
         ESP_LOGW(TAG, "UBX startup configuration disabled");
     }
+
+    /* MON-VER is a read-only poll and does not alter receiver configuration. */
+    ubx_poll_mon_ver();
 
     const BaseType_t task_created = xTaskCreate(
         gnss_task,

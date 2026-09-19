@@ -66,6 +66,12 @@ typedef struct {
     uint32_t valid_zda_messages;
     uint32_t invalid_messages;
     uint32_t uart_bytes_received;
+
+    /* UBX-MON-VER receiver identity. Empty strings mean not reported yet. */
+    bool receiver_identity_valid;
+    char receiver_model[32];
+    char receiver_software_version[31];
+    char receiver_hardware_version[11];
 } gnss_service_status_t;
 
 esp_err_t gnss_service_init(void);
