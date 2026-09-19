@@ -1,5 +1,6 @@
 #include "app_state.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -16,6 +17,22 @@ void app_state_init(void)
     s_state.initialized = true;
     s_state.leap_indicator = APP_LEAP_UNKNOWN;
     s_state.clock_state = APP_CLOCK_UNSYNCHRONIZED;
+
+    portEXIT_CRITICAL(&s_state_lock);
+}
+
+void app_state_set_device_hostname(const char *hostname)
+{
+    if (hostname == NULL) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_state_lock);
+
+    (void)snprintf(s_state.device_hostname,
+                   sizeof(s_state.device_hostname),
+                   "%s",
+                   hostname);
 
     portEXIT_CRITICAL(&s_state_lock);
 }

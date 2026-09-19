@@ -25,6 +25,50 @@ typedef struct {
     int64_t last_request_monotonic_us;
     int64_t last_response_monotonic_us;
 
+    /*
+     * Phase 6B diagnostic-only software timestamp path measurements.
+     * All values are microseconds measured with esp_timer_get_time().
+     */
+    uint32_t timing_samples;
+
+    uint32_t rx_timestamp_start_min_us;
+    uint32_t rx_timestamp_start_avg_us;
+    uint32_t rx_timestamp_start_max_us;
+
+    uint32_t rx_timestamp_call_min_us;
+    uint32_t rx_timestamp_call_avg_us;
+    uint32_t rx_timestamp_call_max_us;
+
+    uint32_t response_build_min_us;
+    uint32_t response_build_avg_us;
+    uint32_t response_build_max_us;
+
+    uint32_t tx_timestamp_to_send_min_us;
+    uint32_t tx_timestamp_to_send_avg_us;
+    uint32_t tx_timestamp_to_send_max_us;
+
+    uint32_t send_call_min_us;
+    uint32_t send_call_avg_us;
+    uint32_t send_call_max_us;
+
+    uint32_t total_response_min_us;
+    uint32_t total_response_avg_us;
+    uint32_t total_response_max_us;
+
+    /* Phase 6C.4B diagnostic-only HW RX versus existing SW RX comparison. */
+    uint32_t hw_rx_compare_samples;
+    uint32_t hw_rx_compare_misses;
+    int64_t hw_rx_delta_last_ns;
+    int64_t hw_rx_delta_min_ns;
+    int64_t hw_rx_delta_avg_ns;
+    int64_t hw_rx_delta_max_ns;
+    uint32_t hw_rx_mapping_bracket_last_ns;
+    uint32_t hw_rx_mapping_age_last_us;
+
+    /* Phase 6C.4C authoritative hardware receive timestamping. */
+    uint32_t hw_rx_authoritative_responses;
+    uint32_t hw_rx_authority_drops;
+
     uint8_t advertised_stratum;
     uint8_t advertised_leap_indicator;
     uint32_t advertised_root_dispersion;

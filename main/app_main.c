@@ -1,5 +1,6 @@
 #include "app_state.h"
 #include "clock_discipline.h"
+#include "device_config.h"
 #include "diagnostics.h"
 #include "eth_service.h"
 #include "gnss_service.h"
@@ -67,6 +68,15 @@ void app_main(void)
 
     app_state_init();
 
+    err = device_config_init();
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "Device configuration initialization failed: %s",
+                 esp_err_to_name(err));
+        return;
+    }
+
     err = pps_service_init();
 
     if (err != ESP_OK) {
@@ -131,5 +141,5 @@ void app_main(void)
     }
 
     ESP_LOGI(TAG,
-             "Ethernet, NTP, and read-only management console started");
+             "Ethernet, NTP, and read-only HTTPS management console started");
 }
