@@ -17,6 +17,8 @@
 #include "gnss_service.h"
 #include "ntp_server.h"
 #include "ntp_types.h"
+#include "nts_ke.h"
+#include "nts_ntp_auth.h"
 #include "pps_service.h"
 
 #include "esp_err.h"
@@ -1400,6 +1402,8 @@ static esp_err_t send_status_json(httpd_req_t *request)
     pps_service_status_t pps_status;
     eth_service_status_t eth_status;
     ntp_server_status_t ntp_status;
+    nts_ke_stats_t nts_ke_stats;
+    nts_ntp_auth_stats_t nts_auth_stats;
 
     (void)app_state_get_snapshot(&app_status);
     (void)clock_discipline_get_status(&clock_status);
@@ -1407,6 +1411,8 @@ static esp_err_t send_status_json(httpd_req_t *request)
     (void)pps_service_get_status(&pps_status);
     (void)eth_service_get_status(&eth_status);
     (void)ntp_server_get_status(&ntp_status);
+    nts_ke_get_stats(&nts_ke_stats);
+    nts_ntp_auth_get_stats(&nts_auth_stats);
 
     const esp_ip4_addr_t device_ip = {
         .addr = eth_status.ipv4_address,
@@ -1513,6 +1519,18 @@ static esp_err_t send_status_json(httpd_req_t *request)
         "\"last_client\":\"" IPSTR "\","
         "\"last_request_monotonic_us\":%" PRId64 ","
         "\"last_response_monotonic_us\":%" PRId64
+        "},"
+        "\"nts\":{"
+        "\"ke_running\":%s,"
+        "\"ke_exchanges\":%" PRIu32 ","
+        "\"ke_exchange_failures\":%" PRIu32 ","
+        "\"ke_tls_handshake_failures\":%" PRIu32 ","
+        "\"ke_alpn_rejections\":%" PRIu32 ","
+        "\"verification_attempts\":%" PRIu32 ","
+        "\"authenticated_requests\":%" PRIu32 ","
+        "\"verification_failures\":%" PRIu32 ","
+        "\"protected_responses\":%" PRIu32 ","
+        "\"protection_failures\":%" PRIu32
         "}"
         "}",
         APP_WEB_CONSOLE_PORT,
@@ -1582,7 +1600,18 @@ static esp_err_t send_status_json(httpd_req_t *request)
         ntp_status.advertised_root_dispersion,
         IP2STR(&last_client),
         ntp_status.last_request_monotonic_us,
-        ntp_status.last_response_monotonic_us);
+        ntp_status.last_response_monotonic_us,
+
+        nts_ke_stats.running ? "true" : "false",
+        nts_ke_stats.exchanges_completed,
+        nts_ke_stats.exchange_failures,
+        nts_ke_stats.tls_handshake_failures,
+        nts_ke_stats.alpn_rejections,
+        nts_auth_stats.verification_attempts,
+        nts_auth_stats.authenticated_requests,
+        nts_auth_stats.verification_failures,
+        nts_auth_stats.protected_responses,
+        nts_auth_stats.protection_failures);
 
     if (length < 0 || length >= (int)sizeof(response)) {
         return httpd_resp_send_err(request,
@@ -1651,14 +1680,18 @@ static esp_err_t send_metrics_response(httpd_req_t *request)
     pps_service_status_t pps_status;
     eth_service_status_t eth_status;
     ntp_server_status_t ntp_status;
+    nts_ke_stats_t nts_ke_stats;
+    nts_ntp_auth_stats_t nts_auth_stats;
 
     (void)clock_discipline_get_status(&clock_status);
     (void)gnss_service_get_status(&gnss_status);
     (void)pps_service_get_status(&pps_status);
     (void)eth_service_get_status(&eth_status);
     (void)ntp_server_get_status(&ntp_status);
+    nts_ke_get_stats(&nts_ke_stats);
+    nts_ntp_auth_get_stats(&nts_auth_stats);
 
-    char response[3072];
+    char response[4096];
 
     const int length = snprintf(
         response,
@@ -1708,7 +1741,28 @@ static esp_err_t send_metrics_response(httpd_req_t *request)
         "# HELP esp32_ntp_server_unsynchronized_drops_total "
         "Fail-closed NTP drops.\n"
         "# TYPE esp32_ntp_server_unsynchronized_drops_total counter\n"
-        "esp32_ntp_server_unsynchronized_drops_total %" PRIu32 "\n",
+        "esp32_ntp_server_unsynchronized_drops_total %" PRIu32 "\n"
+        "# HELP esp32_nts_ke_running NTS-KE service running state.\n"
+        "# TYPE esp32_nts_ke_running gauge\n"
+        "esp32_nts_ke_running %d\n"
+        "# HELP esp32_nts_ke_exchanges_total Successful NTS-KE exchanges.\n"
+        "# TYPE esp32_nts_ke_exchanges_total counter\n"
+        "esp32_nts_ke_exchanges_total %" PRIu32 "\n"
+        "# HELP esp32_nts_ke_exchange_failures_total Failed NTS-KE exchanges.\n"
+        "# TYPE esp32_nts_ke_exchange_failures_total counter\n"
+        "esp32_nts_ke_exchange_failures_total %" PRIu32 "\n"
+        "# HELP esp32_nts_authenticated_requests_total Authenticated NTS NTP requests.\n"
+        "# TYPE esp32_nts_authenticated_requests_total counter\n"
+        "esp32_nts_authenticated_requests_total %" PRIu32 "\n"
+        "# HELP esp32_nts_verification_failures_total NTS NTP verification failures.\n"
+        "# TYPE esp32_nts_verification_failures_total counter\n"
+        "esp32_nts_verification_failures_total %" PRIu32 "\n"
+        "# HELP esp32_nts_protected_responses_total Protected NTS NTP responses.\n"
+        "# TYPE esp32_nts_protected_responses_total counter\n"
+        "esp32_nts_protected_responses_total %" PRIu32 "\n"
+        "# HELP esp32_nts_protection_failures_total NTS response protection failures.\n"
+        "# TYPE esp32_nts_protection_failures_total counter\n"
+        "esp32_nts_protection_failures_total %" PRIu32 "\n",
         (int)clock_status.state,
         clock_status.solution_valid ? 1 : 0,
         clock_status.phase_error_ns,
@@ -1723,7 +1777,14 @@ static esp_err_t send_metrics_response(httpd_req_t *request)
         ntp_status.requests_received,
         ntp_status.normal_responses,
         ntp_status.rate_kod_responses,
-        ntp_status.unsynchronized_drops);
+        ntp_status.unsynchronized_drops,
+        nts_ke_stats.running ? 1 : 0,
+        nts_ke_stats.exchanges_completed,
+        nts_ke_stats.exchange_failures,
+        nts_auth_stats.authenticated_requests,
+        nts_auth_stats.verification_failures,
+        nts_auth_stats.protected_responses,
+        nts_auth_stats.protection_failures);
 
     if (length < 0 || length >= (int)sizeof(response)) {
         return httpd_resp_send_err(request,
@@ -3104,9 +3165,10 @@ static esp_err_t index_handler(httpd_req_t *request)
         ":root{color-scheme:dark}*{box-sizing:border-box}\n"
         "body{margin:0;background:#0d141b;color:#e9f0f5;font-family:Arial,sans-serif}\n"
         "header{padding:22px 28px;background:#14212d;border-bottom:1px solid #294252}\n"
+        ".headerline{display:flex;align-items:center;gap:20px}.headertitle{min-width:max-content}.headerstatus{display:flex;justify-content:center;gap:10px;flex-wrap:wrap;flex:1;margin-left:auto}\n"
         "h1{margin:0;color:#58c7ff;font-size:1.55rem}header p{margin:7px 0 0;color:#a8bac7;font-size:.92rem}\n"
         "main{padding:22px;max-width:1500px;margin:auto;overflow:hidden}\n"
-        ".summary{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}\n"
+        ".summary{display:flex;gap:10px;flex-wrap:wrap}\n"
         ".badge{padding:8px 12px;border-radius:999px;font-weight:bold;font-size:.82rem}\n"
         ".ok{background:#173f2b;color:#9bea75}.warn{background:#493b18;color:#ffd569}\n"
         ".bad{background:#4c2226;color:#ff9292}.neutral{background:#223643;color:#a9d8ef}\n"
@@ -3121,12 +3183,13 @@ static esp_err_t index_handler(httpd_req_t *request)
         "button:hover{background:#294d61}button.danger{border-color:#81434a;background:#4c2226}button:disabled{opacity:.55;cursor:not-allowed}\n"
         ".actionmsg{margin-top:12px;color:#a8bac7;overflow-wrap:anywhere}\n"
         "footer{padding:22px 0 4px;color:#8ca1ae;font-size:.82rem}code{color:#9bea75;overflow-wrap:anywhere}\n"
-        "@media(max-width:1200px){.cardcolumns{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:700px){.cardcolumns{grid-template-columns:1fr}main{padding:12px}.row{grid-template-columns:1fr;gap:4px}.value{text-align:left}header{padding:18px}}\n"
+        "@media(max-width:1200px){.cardcolumns{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:700px){.cardcolumns{grid-template-columns:1fr}main{padding:12px}.row{grid-template-columns:1fr;gap:4px}.value{text-align:left}header{padding:18px}.headerline{align-items:flex-start;flex-direction:column}.headerstatus{justify-content:flex-start;margin-left:0}}\n"
         "</style></head><body>\n"
-        "<header><h1>ESP32-P4 GNSS NTP Server</h1>\n"
-        "<p>mTLS-authenticated HTTPS operational console &middot; automatic refresh every three seconds</p></header>\n"
-        "<main><div class=\"summary\" id=\"summary\"></div><div id=\"cards\"></div>\n"
-        "<footer>Authenticated management console &middot; NTP timing remains fail-closed</footer></main>\n"
+        "<header><div class=\"headerline\"><div class=\"headertitle\"><h1>ESP32-P4 GNSS NTP Server</h1>\n"
+        "<p>mTLS-authenticated HTTPS operational console &middot; automatic refresh every three seconds</p></div>\n"
+        "<div class=\"headerstatus\" id=\"summary\"></div></div></header>\n"
+        "<main><div id=\"cards\"></div>\n"
+        "</main>\n"
         "<script>\n"
         "function esc(v){return String(v==null||v===''?'--':v).replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));}\n"
         "function row(k,v){return '<div class=\"row\"><span class=\"key\">'+esc(k)+'</span><span class=\"value\">'+esc(v)+'</span></div>';}\n"
@@ -3207,10 +3270,19 @@ static esp_err_t index_handler(httpd_req_t *request)
         "   row('Responses Sent',d.ntp.responses),row('Invalid Requests',d.ntp.invalid_requests),\n"
         "   row('Fail-Closed Drops',d.ntp.unsynchronized_drops),row('RATE KoD Responses',d.ntp.rate_kod),\n"
         "   row('Last Client',d.ntp.last_client)]));\n"
-        "  col2.push(card('Network',[\n"
+        "  col2.push(card('NTS Service',[\n"
+        "   row('NTS-KE Running',yesNo(d.nts.ke_running)),row('NTS-KE Exchanges',d.nts.ke_exchanges),\n"
+        "   row('NTS-KE Failures',d.nts.ke_exchange_failures),row('TLS Handshake Failures',d.nts.ke_tls_handshake_failures),\n"
+        "   row('ALPN Rejections',d.nts.ke_alpn_rejections),row('Verification Attempts',d.nts.verification_attempts),\n"
+        "   row('Authenticated Requests',d.nts.authenticated_requests),row('Verification Failures',d.nts.verification_failures),\n"
+        "   row('Protected Responses',d.nts.protected_responses),row('Protection Failures',d.nts.protection_failures)]));\n"        "  col2.push(card('API Locations',[\n"
+        "   row('Status','/api/v1/status'),row('Health','/api/v1/health'),row('Metrics','/metrics'),\n"
+        "   row('Configuration','GET /api/v1/config'),row('Hostname','PUT /api/v1/config/hostname'),\n"
+        "   row('Cloudflare','PUT/DELETE /api/v1/config/cloudflare')]));\n"
+        "  col3.push(card('Network',[\n"
         "   row('Hostname',d.device.hostname),row('IPv4 Address',d.device.ipv4),row('Netmask',d.device.netmask),\n"
         "   row('Gateway',d.device.gateway),row('Ethernet Link',yesNo(d.device.link_up)),row('Ethernet MAC',d.device.mac)]));\n"
-        "  col3.push(card('System Actions',[\n"
+        "  col1.push(card('System Actions',[\n"
         "   row('Management TLS',d.console.mode),row('Renewal Eligible Now',yesNo(sched.eligible))\n"
         "  ],'<div class=\"actions\"><button id=\"renewbtn\" onclick=\"renew()\">Renew Certificate</button><button id=\"rebootbtn\" class=\"danger\" onclick=\"reboot()\">Reboot Device</button></div><div id=\"actionmsg\" class=\"actionmsg\">Actions require this authenticated mTLS session.</div>'));\n"
         "  document.getElementById('cards').innerHTML='<div class=\"cardcolumns\"><div class=\"cardcol\">'+col1.join('')+'</div><div class=\"cardcol\">'+col2.join('')+'</div><div class=\"cardcol\">'+col3.join('')+'</div><div class=\"cardcol\">'+col4.join('')+'</div></div>';\n"

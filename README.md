@@ -8,13 +8,11 @@ an authenticated HTTPS management plane.
 > **Current production baseline:** Phase 5B management/security and
 > certificate lifecycle are frozen. Phase 6 NTP hardware timestamping,
 > precision optimization, end-to-end validation, production stability,
-> and startup PTP/UTC correlation optimization are **VALIDATED /
-> FROZEN**.
->
-> **Current experimental track:** HP-LP Testing Build. HP-LP.1 LP-core
-> bring-up and HP-LP.2 mailbox communication are **PASS / FROZEN**.
-> HP-LP.3 passive PPS observation is paused before implementation. The
-> LP core currently has **no production timing authority**.
+> and startup PTP/UTC correlation optimization are **VALIDATED / FROZEN**.
+> The HP-LP independent PPS health-supervision track is **PASS / FROZEN / CLOSED**.
+> **NTS-Intergration** is **PASS / CLOSED**, with the NTS subsystem
+> **VALIDATED / FROZEN**.
+
 
 ## Platform
 
@@ -31,8 +29,9 @@ an authenticated HTTPS management plane.
 | Flash encryption | Enabled on the provisioned target, Development Mode |
 | Management | HTTPS on TCP/443 with mandatory mTLS |
 | NTP | UDP/123, NTP versions 1-4 client requests |
+| NTS | NTS-KE on TCP/4460; NTS-protected NTP on UDP/123 |
 | Ethernet timing | ESP32-P4 EMAC PTP hardware RX/TX timestamp support integrated |
-| LP core | Experimental observer/proof track only |
+| LP core | Independent passive GNSS PPS health supervisor; no timing authority |
 
 ### Validated pin assignments
 
@@ -234,11 +233,7 @@ tracking. The current configuration schema stores the device hostname
 and Cloudflare configuration metadata. Hostname changes persist across
 reboot.
 
-Default device hostname:
-
-``` text
-esp32p4-ntp
-```
+The configured device name is intentionally not documented here.
 
 ### HTTPS and mutual TLS
 
@@ -368,19 +363,27 @@ information rather than inventing a renewal timestamp.
 
 ### Management dashboard
 
-The frozen Phase 5 dashboard displays live clock, PPS, GNSS receiver,
-NTP, network, certificate/ACME, and system-operation information.
+The management dashboard displays live clock, PPS, GNSS receiver, NTP,
+NTS, network, certificate/ACME, and system-operation information.
 
 Wide-screen layout uses independent vertical column stacks:
 
 ``` text
-Clock and Time       PPS Capture       GNSS Receiver       Certificate & ACME
-NTP Service          Network           System Actions
+Header: live Clock / NTP / GNSS / Certificate / Renewal status
+
+Column 1             Column 2             Column 3          Column 4
+Clock and Time       PPS Capture          GNSS Receiver     Certificate & ACME
+NTP Service          NTS Service          Network
+System Actions       API Locations
 ```
 
+The NTS Service card exposes NTS-KE state and exchange counters together
+with authenticated-request and protected-response counters. It also reports
+TLS handshake, ALPN, verification, and response-protection failures. The same
+NTS observability is available through `/api/v1/status` and `/metrics`.
+
 The GNSS card includes receiver-reported UBX-MON-VER identity, software
-version, and hardware version. The certificate hostname is displayed
-without wrapping `ts1.nicknewman.au`.
+version, and hardware version. The certificate identity is displayed without wrapping.
 
 System Actions provides authenticated controls for:
 
@@ -491,6 +494,155 @@ completed validation substantially exceeded that request load.
 ``` text
 Startup PTP/UTC correlation optimization PASS / FROZEN
 NTP subsystem                            VALIDATED / FROZEN
+```
+
+## Phase 7 --- NTS-Intergration
+
+Phase 7 integrated Network Time Security around the frozen production NTP
+timing path. NTS adds authentication authority only; it does not own or alter
+GNSS/PPS discipline, authoritative hardware RX timestamping, late-L2 T3/XMT
+placement, or the frozen transmit compensation.
+
+### Phase 7A --- architecture and integration boundary
+
+The integration reused the existing Phase 5B production ACME certificate and
+private-key lifecycle for the NTS-KE TLS server identity. Management HTTPS on
+TCP/443 remains independently protected by mandatory client-certificate mTLS.
+No second TLS certificate authority or certificate store was introduced.
+
+``` text
+NTS-KE TLS identity          existing production ACME certificate/key
+NTS-KE transport             TCP/4460
+Management HTTPS             TCP/443, mandatory mTLS, unchanged
+NTP transport                UDP/123, unchanged
+Timing authority             existing disciplined NTP path, unchanged
+HW RX authority              authoritative / fail-closed, unchanged
+Late-L2 T3/XMT               unchanged
+TX compensation              98,941 ns / FROZEN
+```
+
+**Phase 7A: PASS / FROZEN.**
+
+### Phase 7B --- cryptographic and cookie foundation
+
+NTS cookie-key persistence uses the existing encrypted `nvs_certs` partition
+under a separate `nts` namespace. The NTS cookie implementation uses
+AES-SIV-CMAC-256 with authenticated cookie metadata and fail-closed validation.
+The production key ring maintains previous, active, and next key slots.
+
+``` text
+nvs_certs
+├── namespace "acme"    ACME account state
+└── namespace "nts"     NTS cookie key ring
+
+NTS AEAD                  AES-SIV-CMAC-256 / algorithm 15
+Cookie clear prefix       master-key ID + nonce
+Cookie validation         key ID, format/version, issue/expiry, authentication
+```
+
+**Phase 7B: PASS / FROZEN.**
+
+### Phase 7C --- NTS-KE server
+
+NTS-KE is served on TCP/4460 using TLS 1.3 and ALPN `ntske/1`. The server
+negotiates NTPv4 as the next protocol and AES-SIV-CMAC-256 as the AEAD, and
+issues eight initial cookies. The NTS-KE endpoint does not require the
+management-plane client certificate.
+
+``` text
+TCP port                     4460
+TLS                          1.3
+ALPN                         ntske/1
+Next Protocol                NTPv4 / 0
+AEAD                         AES-SIV-CMAC-256 / 15
+Initial cookies              8
+Cookie size                  128 bytes
+```
+
+**Phase 7C: PASS / FROZEN.**
+
+### Phase 7D --- NTS-protected NTP
+
+NTS extension-field processing wraps the existing UDP/123 NTP response path.
+Authenticated requests are verified with the cookie-derived C2S key. Responses
+echo the Unique Identifier, issue fresh cookies, and are authenticated with the
+S2C key. The existing authoritative mapped hardware RX timestamp remains T2,
+and the existing late-L2 path remains responsible for T3/XMT.
+
+``` text
+NTS request
+  -> existing HW RX timestamp
+  -> parse UID / Cookie / Authenticator
+  -> decrypt cookie and authenticate with C2S
+  -> existing production NTP response construction
+  -> append NTS response fields and authenticate with S2C
+  -> existing late-L2 T3/XMT + 98,941 ns prediction
+  -> MAC/DMA
+```
+
+Invalid NTS authentication fails closed without producing an authenticated
+response. Conventional non-NTS NTP service remains supported and was
+regression-tested.
+
+**Phase 7D: PASS / FROZEN.**
+
+### Phase 7E --- key lifecycle and persistence
+
+The previous/active/next cookie-key lifecycle, promotion, persistence across
+reboot, and missing/corrupt-state handling were validated. Production test
+seams were removed after validation.
+
+**Phase 7E: PASS / FROZEN.**
+
+### Phase 7F --- interoperability and production regression
+
+Interoperability was validated with chrony 4.5 using:
+
+``` text
+server <configured-server> nts iburst minpoll 2 maxpoll 4
+```
+
+Six consecutive validation trials acquired the NTS source in approximately
+3-4 seconds. A final post-dashboard regression selected
+`the configured NTS source` in approximately 3 seconds.
+
+Final live observability confirmed one completed NTS-KE exchange followed by
+nine authenticated NTS requests and nine protected responses, with zero NTS-KE
+exchange failures, zero ALPN rejections, zero verification failures, and zero
+response-protection failures. Two TLS handshake failures recorded during the
+final test session were caused by deliberate raw TCP reachability probes that
+opened TCP/4460 without performing TLS.
+
+``` text
+NTS-KE Running              YES
+NTS-KE Exchanges              1
+NTS-KE Failures               0
+TLS Handshake Failures        2   raw TCP probes
+ALPN Rejections               0
+Verification Attempts         9
+Authenticated Requests        9
+Verification Failures         0
+Protected Responses           9
+Protection Failures           0
+```
+
+The NTP production path remained synchronized and fail-closed protections
+remained intact during NTS validation.
+
+**Phase 7F: PASS / FROZEN.**
+
+### Final Phase 7 gate
+
+``` text
+7A  NTS architecture + integration boundary       PASS / FROZEN
+7B  NTS key/cookie cryptographic foundation        PASS / FROZEN
+7C  NTS-KE server on TCP/4460                      PASS / FROZEN
+7D  NTS-protected NTP packet processing            PASS / FROZEN
+7E  key rotation / persistence / failure handling  PASS / FROZEN
+7F  interoperability + production regression       PASS / FROZEN
+
+Phase 7 NTS-Intergration                           PASS / CLOSED
+NTS subsystem                                      VALIDATED / FROZEN
 ```
 
 ## Protected storage and flash security
@@ -605,11 +757,10 @@ Exact log ordering can vary because services run concurrently.
     -   production certificate dual-slot/recovery state is evaluated.
     -   last-known-good TLS protections are applied.
     -   the permitted TLS source is selected.
-4.  **HP-LP test initialization --- experimental builds only**
-    -   LP binary is loaded and started.
-    -   HP-LP.1 execution proof and HP-LP.2 mailbox proof may run.
-    -   LP remains non-authoritative.
-    -   production PPS/GNSS/clock/Ethernet/NTP ownership remains on HP.
+4.  **HP-LP PPS health supervision**
+    -   LP firmware starts as an independent passive PPS health observer.
+    -   GPIO 4 is the LP observer input; GPIO 5 remains the authoritative HP PPS input.
+    -   LP supervision has no GNSS, clock-discipline, Ethernet, or NTP authority.
 5.  **PPS capture**
     -   GPTimer and ETM PPS capture initialize.
     -   GPIO 5 rising-edge timing becomes available to the discipline
@@ -645,7 +796,12 @@ Exact log ordering can vary because services run concurrently.
     -   HOLDOVER moves service to Stratum 2 with increasing root
         dispersion.
     -   unserviceable states fail closed.
-10. **HTTPS management**
+10. **NTS-KE and NTS-protected NTP**
+    -   NTS-KE starts on TCP/4460 using TLS 1.3 and ALPN `ntske/1`.
+    -   the existing production ACME certificate/key supplies the NTS-KE TLS identity.
+    -   NTS cookies and cookie-key state are restored from protected storage.
+    -   authenticated NTS requests wrap the frozen UDP/123 timing path without taking timing authority.
+11. **HTTPS management**
     -   HTTPS starts on TCP/443.
     -   selected server certificate/key are loaded.
     -   independent management CA is configured.
@@ -653,17 +809,18 @@ Exact log ordering can vary because services run concurrently.
     -   dashboard/status/health/metrics/configuration/Cloudflare/ACME/system
         endpoints become available.
     -   no unauthenticated HTTP/80 management service is started.
-11. **Automatic certificate-renewal scheduler**
+12. **Automatic certificate-renewal scheduler**
     -   persisted automatic-renewal configuration is restored.
     -   the first evaluation occurs after its startup delay.
     -   normal evaluation repeats approximately every six hours.
     -   issuance and activation remain policy/interlock gated.
-12. **Healthy steady state**
+13. **Healthy steady state**
     -   `/api/v1/health` returns HTTP 200 with `ntp_ready:true`.
-    -   dashboard reports GNSS/PPS/clock/network/NTP state.
+    -   dashboard reports GNSS/PPS/clock/network/NTP/NTS state.
     -   PTP/UTC correlation remains maintained at its 10-second
         steady-state cadence.
     -   NTP clients receive validated service.
+    -   NTS clients can acquire authenticated time through NTS-KE plus protected NTP.
     -   management remains protected by mTLS.
 
 Expected healthy timing/NTP state:
@@ -689,149 +846,65 @@ TX compensation = 98941 ns
 Management requires a trusted client certificate.
 
 ``` text
-https://<device-ip>/
-https://<device-ip>/api/v1/status
-https://<device-ip>/api/v1/health
-https://<device-ip>/metrics
+https://<management-endpoint>/
+https://<management-endpoint>/api/v1/status
+https://<management-endpoint>/api/v1/health
+https://<management-endpoint>/metrics
 ```
 
 Windows NTP compatibility check:
 
 ``` powershell
-w32tm /stripchart /computer:<device-ip> /dataonly /samples:5
+w32tm /stripchart /computer:<management-endpoint> /dataonly /samples:5
 ```
 
 The Phase 5B validation also used NTPTool successfully after the NTPv1
 compatibility update.
+
+NTS interoperability check uses chrony with the production hostname:
+
+``` text
+server <configured-server> nts iburst minpoll 2 maxpoll 4
+```
+
+A successful test selects `the configured NTS source` after completing
+NTS-KE and authenticated NTP exchanges.
 
 For startup investigation only, repeated one-sample `w32tm` invocations
 were used to identify readiness behavior. This is a stress probe and can
 trigger RATE KoD responses; it is not the normal runtime validation
 cadence.
 
-## HP-LP Testing Build
+## HP-LP independent PPS health supervision
 
-HP-LP work is a separate experimental track after the validated Phase 6
-NTP baseline. It must not silently modify frozen production timing
-behavior.
-
-The LP core is a separate low-power RISC-V execution environment, not
-another FreeRTOS application core.
-
-### Experimental boundaries
+The HP-LP track is complete and frozen. The LP core is an independent passive
+observer of GNSS PPS health and has no production timing authority.
 
 ``` text
-Production NTP subsystem        VALIDATED / FROZEN
-PPS authority                   HP / UNCHANGED
-GNSS authority                  HP / UNCHANGED
-Clock discipline authority      HP / UNCHANGED
-Ethernet/NTP authority          HP / UNCHANGED
-LP production authority         NONE
+GPIO 5 -> HP authoritative PPS via GPIO ISR + GPIO ETM -> GPTimer
+GPIO 4 -> LP passive PPS observer
+
+HP timing authority              UNCHANGED
+LP timing authority              NONE
+LP interval plausibility         ENABLED
+LP autonomous loss watchdog      2.5 PPS periods
+LP loss/recovery counters        ENABLED
 ```
 
-### HP-LP.1 --- LP-core bring-up
-
-Current test files:
+Final fault-injection validation disconnected GPIO 4 while GPIO 5 remained
+authoritative. The LP observer transitioned HEALTHY -> LOST and recorded one
+loss while production timing remained synchronized with valid NTP responses and
+zero drops. Reconnecting GPIO 4 produced LOST -> HEALTHY with one recovery and
+no duplicate events. Final production NTP regression passed.
 
 ``` text
-main/
-    hp_lp_test.c
-    hp_lp_test.h
-    ulp/
-        hp_lp_test_lp.c
+HP-LP.1-7   Core LP proof                         PASS / FROZEN
+HP-LP.8     Independent PPS health supervision    PASS / FROZEN
+HP-LP.9     Production regression / closeout      PASS / FROZEN
+HP-LP                                             CLOSED
 ```
 
-The component uses `ulp_embed_binary()` to build and embed the LP
-application.
-
-Validated runtime proof:
-
-``` text
-LP binary load                     PASS
-ulp_lp_core_run()                  PASS
-LP main() execution                PASS
-Continuous LP execution            PASS
-LP -> HP shared-variable visibility PASS
-```
-
-The LP execution proof used magic value `0x4C50434F` and an advancing
-counter.
-
-**HP-LP.1: PASS / FROZEN.**
-
-### HP-LP.2 --- mailbox communication
-
-The proof-only shared counter was followed by validation of the ESP-IDF
-v6.1 HP/LP mailbox mechanism.
-
-Validated round trip:
-
-``` text
-HP -> LP command:  0x1234
-LP -> HP response: 0x1235
-HP-LP mailbox proof PASS
-```
-
-This establishes bounded HP-to-LP command delivery, LP processing,
-LP-to-HP response delivery, and response integrity without involving
-PPS, GNSS, clock discipline, Ethernet, or NTP authority.
-
-**HP-LP.2: PASS / FROZEN.**
-
-### HP-LP.3 --- passive PPS observation
-
-**Current stopping point: PAUSED before implementation.**
-
-Feasibility work established that GPIO 5 is available as an LP IO and
-that the LP core supports GPIO input and edge interrupts. The unresolved
-question is whether the same physical PPS signal can be observed by the
-LP GPIO/RTCIO path while the existing HP GPTimer/ETM path remains
-authoritative and unchanged.
-
-Target architecture:
-
-``` text
-GNSS PPS
-   |
-   v
-GPIO 5
-   +------> existing HP ETM capture   [AUTHORITATIVE]
-   |
-   +------> LP GPIO observer          [PASSIVE ONLY]
-```
-
-ESP-IDF requires HP-side RTC GPIO initialization before LP firmware uses
-an IO. That operation may affect pad mux/function ownership, so it must
-not be introduced on GPIO 5 until coexistence with the existing HP ETM
-path is proven.
-
-If passive simultaneous observation cannot be achieved without
-disturbing the HP path, the LP experiment must use another routing
-strategy or stop.
-
-### HP-LP.4 --- HP versus LP PPS comparison
-
-Future gate after passive observation:
-
--   compare edge counts
--   detect missing/duplicate observations
--   characterize LP observation latency/jitter
--   compare LP observations against authoritative HP PPS timestamps
--   perform stability testing
-
-No authority transfer occurs in HP-LP.4.
-
-### HP-LP.5 --- controlled handoff evaluation
-
-Only after HP-LP.3 and HP-LP.4 pass should controlled offload be
-evaluated.
-
-Any handoff must define ownership, startup/recovery behavior, HP/LP
-synchronization, mailbox failure handling, reset behavior, fail-closed
-behavior, accuracy, and regression criteria against the frozen HP
-implementation.
-
-No timing handoff is currently approved.
+No further LP timing work is planned for the frozen baseline.
 
 ## Known technical debt
 
@@ -856,75 +929,48 @@ No timing handoff is currently approved.
     on the very low deployment request rate and heavier completed
     validation; reopen only if deployment load or architecture changes
     materially.
--   HP-LP code remains experimental and has no production timing
-    authority.
--   GPIO 5 LP observation requires explicit coexistence proof before LP
-    GPIO initialization is allowed to touch the production PPS pin.
+-   LP PPS supervision remains strictly non-authoritative; future LP changes
+    must preserve GPIO 5 HP timing authority and the validated GPIO 4 observer path.
+-   NTS cookie-key persistence and NTS-KE certificate reuse must remain aligned
+    with the protected-storage and ACME lifecycle when those subsystems change.
 -   Secure Boot is intentionally not part of this project's security
     model.
 
 ## Future additions
 
-Phase 5 and the production Phase 6 NTP subsystem are frozen. Future work
-must be introduced through explicit new gates rather than silently
+Phase 5B, Phase 6, HP-LP supervision, and Phase 7 NTS-Intergration are frozen.
+Future work must be introduced through explicit new gates rather than silently
 changing the validated baseline.
 
-1.  **HP-LP.3 passive PPS observation**
-    -   prove GPIO 5 can be observed by LP without disturbing HP ETM
-        capture
-    -   keep HP PPS authoritative
-    -   abort or reroute if pad-mux ownership conflicts
-2.  **HP-LP.4 HP/LP PPS comparison**
-    -   compare counts, latency, jitter and reliability
-    -   establish whether LP observation provides useful offload
-        capability
-3.  **HP-LP.5 controlled offload decision**
-    -   evaluate selected PPS/GNSS/housekeeping offload only after
-        observer validation
-    -   do not move Ethernet MAC/DMA, critical NTP T3/TX, or clock
-        discipline without a separate architecture gate
-4.  **Symmetric peer health monitoring --- observe only**
+1.  **Symmetric peer health monitoring --- observe only**
     -   configure one or more peer NTP servers
     -   measure reachability, delay and offset
     -   expose peer state through HTTPS/API/metrics
     -   do not discipline the GNSS clock or alter stratum automatically
-5.  **ACME/DNS hardening**
-    -   extend bounded `badNonce` handling to the initial new-account
-        JWK path
+2.  **ACME/DNS hardening**
+    -   extend bounded `badNonce` handling to the initial new-account JWK path
     -   consider authoritative DNS propagation verification
     -   add lifecycle diagnostics only where they do not expose secrets
-6.  **Management-plane hardening and operations**
+3.  **Management-plane hardening and operations**
     -   review CSRF protections for mutable browser endpoints
-    -   expand audit/event history for configuration and certificate
-        operations
-    -   consider role separation if multiple management identities are
-        introduced
-7.  **OTA lifecycle**
-    -   design authenticated OTA around the existing `ota_0`/`ota_1`
-        partition layout
-    -   define rollback and image-integrity policy compatible with flash
-        encryption and the deliberate decision not to use Secure Boot
+    -   expand audit/event history for configuration and certificate operations
+    -   consider role separation if multiple management identities are introduced
+4.  **OTA lifecycle**
+    -   design authenticated OTA around the existing `ota_0`/`ota_1` partition layout
+    -   define rollback and image-integrity policy compatible with flash encryption
+        and the deliberate decision not to use Secure Boot
     -   do not introduce OTA as an incidental management endpoint
-8.  **SDK/toolchain maintenance**
+5.  **SDK/toolchain maintenance**
     -   re-evaluate the local NVS workaround on SDK upgrade
     -   reconcile Ethernet/DMA timestamp changes with upstream ESP-IDF
-    -   rerun Phase 6 hardware timestamp and TX compensation validation
-        after material SDK/toolchain changes
-9.  **Internal cleanup**
+    -   rerun Phase 6 hardware timestamp and TX compensation validation after
+        material SDK/toolchain changes
+    -   rerun NTS interoperability and protected-storage regression after material
+        TLS/crypto/storage changes
+6.  **Internal cleanup**
     -   rename the TIM-TP qErr status field to reflect picoseconds
-    -   remove obsolete compatibility/development code only after
-        regression testing
+    -   remove obsolete compatibility/development code only after regression testing
     -   preserve clean production copies of low-level Ethernet changes
-
-### NTS remains deferred
-
-Network Time Security is not part of the Phase 5/6 frozen baseline.
-
-Do not casually reintroduce the previously deferred NTS modules,
-TCP/4460 listener, cookie/key-store code, or old provisioning code. If
-NTS is resumed, treat it as a new explicitly planned phase and reconcile
-it with the current mTLS/ACME/protected-storage and hardware-timestamp
-architecture first.
 
 ## Engineering invariants
 
@@ -953,9 +999,10 @@ When extending the project:
     server certificate
 -   do not weaken mTLS to hide expected rejected/speculative browser
     connections
--   preserve HP PPS/GNSS/clock/Ethernet/NTP authority during HP-LP
-    observer experiments
--   do not reintroduce NTS unless explicitly planned
+-   preserve HP PPS/GNSS/clock/Ethernet/NTP authority; LP PPS supervision remains non-authoritative
+-   preserve NTS-KE use of the existing production ACME certificate/key lifecycle
+-   preserve separation between management mTLS authentication and NTS-KE TLS
+-   preserve NTS authentication as a wrapper around, not a replacement for, the frozen NTP timing path
 -   use complete source replacements for controlled source changes
 -   do not claim a change is compiled or runtime-tested until it
     actually has been validated
@@ -971,11 +1018,19 @@ Phase 6C hardware timestamping              PASS / FROZEN
 Phase 6D end-to-end validation              PASS / FROZEN
 Phase 6E production stability               PASS / CLOSED
 Startup PTP/UTC correlation optimization    PASS / FROZEN
-
 NTP subsystem                               VALIDATED / FROZEN
 
-HP-LP.1 LP-core bring-up                    PASS / FROZEN
-HP-LP.2 mailbox communication               PASS / FROZEN
-HP-LP.3 passive PPS observation             PAUSED / NEXT
-```
+HP-LP.1-7 core LP proof                     PASS / FROZEN
+HP-LP.8 independent PPS health supervision  PASS / FROZEN
+HP-LP.9 production regression / closeout    PASS / FROZEN
+HP-LP                                       CLOSED
 
+Phase 7A architecture / integration         PASS / FROZEN
+Phase 7B crypto / cookie foundation         PASS / FROZEN
+Phase 7C NTS-KE TCP/4460                    PASS / FROZEN
+Phase 7D NTS-protected NTP                  PASS / FROZEN
+Phase 7E key lifecycle / persistence        PASS / FROZEN
+Phase 7F interoperability / regression      PASS / FROZEN
+Phase 7 NTS-Intergration                    PASS / CLOSED
+NTS subsystem                               VALIDATED / FROZEN
+```

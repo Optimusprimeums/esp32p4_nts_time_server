@@ -1,993 +1,768 @@
 #include "nts_ke.h"
 
-#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "app_config.h"
-#include "app_state.h"
-#include "key_store.h"
-#include "nts_aes_siv.h"
+#include "acme_client.h"
 #include "nts_cookie.h"
+#include "nts_storage.h"
 
+#include "esp_err.h"
 #include "esp_log.h"
+#include "esp_random.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/portmacro.h"
 
-#include "lwip/inet.h"
-#include "lwip/sockets.h"
-
-#include "psa/crypto.h"
-
+#include "mbedtls/net_sockets.h"
 #include "mbedtls/pk.h"
 #include "mbedtls/ssl.h"
 #include "mbedtls/x509_crt.h"
 
 static const char *TAG = "NTS_KE";
 
-/*
- * NTS-KE record types.
- */
+#define NTS_KE_PORT                         "4460"
+#define NTS_KE_TASK_STACK_SIZE              24576U
+#define NTS_KE_TASK_PRIORITY                    5U
+#define NTS_KE_REQUEST_MAX                  2048U
+#define NTS_KE_RESPONSE_MAX                 4096U
+#define NTS_KE_COOKIE_COUNT                    8U
+#define NTS_KE_COOKIE_LIFETIME_SECONDS     86400ULL
+
+#define NTS_KE_CRITICAL_BIT                0x8000U
 #define NTS_KE_RECORD_END_OF_MESSAGE       0x0000U
-#define NTS_KE_RECORD_NEXT_PROTOCOL         0x0001U
-#define NTS_KE_RECORD_AEAD_ALGORITHM        0x0004U
-#define NTS_KE_RECORD_NEW_COOKIE            0x0005U
+#define NTS_KE_RECORD_NEXT_PROTOCOL        0x0001U
+#define NTS_KE_RECORD_ERROR                0x0002U
+#define NTS_KE_RECORD_WARNING              0x0003U
+#define NTS_KE_RECORD_AEAD_ALGORITHM       0x0004U
+#define NTS_KE_RECORD_NEW_COOKIE           0x0005U
+#define NTS_KE_RECORD_NTP_SERVER           0x0006U
+#define NTS_KE_RECORD_NTP_PORT             0x0007U
 
-#define NTS_KE_CRITICAL_BIT                 0x8000U
+#define NTS_KE_PROTOCOL_NTPV4              0x0000U
+#define NTS_KE_AEAD_AES_SIV_CMAC_256       0x000FU
 
-/*
- * NTS protocol and AEAD identifiers.
- */
-#define NTS_KE_PROTOCOL_NTPV4               0x0000U
-#define NTS_KE_AEAD_AES_SIV_CMAC_256        0x000FU
+#define NTS_KE_ERROR_UNRECOGNIZED_CRITICAL 0x0000U
+#define NTS_KE_ERROR_BAD_REQUEST           0x0001U
+#define NTS_KE_ERROR_INTERNAL_SERVER       0x0002U
 
-#define NTS_KE_MAX_RECORD_LENGTH            1024U
-#define NTS_KE_CERT_MAX_LENGTH              8192U
-#define NTS_KE_KEY_MAX_LENGTH               8192U
-
-#define NTS_KE_TASK_STACK_SIZE              12288U
-#define NTS_KE_TASK_PRIORITY                9U
-
-static const char NTS_EXPORTER_LABEL[] =
-    "EXPORTER-network-time-security";
-
-static const unsigned char NTS_C2S_CONTEXT[5] = {
-    0x00, 0x00,     /* NTPv4 protocol ID */
-    0x00, 0x0F,     /* AEAD AES-SIV-CMAC-256 */
-    0x00            /* Client-to-server */
-};
-
-static const unsigned char NTS_S2C_CONTEXT[5] = {
-    0x00, 0x00,     /* NTPv4 protocol ID */
-    0x00, 0x0F,     /* AEAD AES-SIV-CMAC-256 */
-    0x01            /* Server-to-client */
-};
-
-static const char *NTS_ALPN_PROTOCOLS[] = {
-    "ntske/1",
-    NULL
-};
+static const char NTS_EXPORTER_LABEL[] = "EXPORTER-network-time-security";
+static const unsigned char NTS_C2S_CONTEXT[5] = {0x00U, 0x00U, 0x00U, 0x0FU, 0x00U};
+static const unsigned char NTS_S2C_CONTEXT[5] = {0x00U, 0x00U, 0x00U, 0x0FU, 0x01U};
+static const char *const NTS_ALPN_PROTOCOLS[] = {"ntske/1", NULL};
 
 typedef struct {
-    int socket_fd;
-} nts_ke_bio_context_t;
+    bool next_protocol_seen;
+    bool aead_seen;
+    bool end_seen;
+    bool ntpv4_offered;
+    bool aes_siv_offered;
+    uint16_t protocol_error;
+} nts_ke_request_state_t;
 
-typedef struct {
-    mbedtls_x509_crt certificate_chain;
-    mbedtls_pk_context private_key;
-    mbedtls_ssl_config ssl_config;
+static TaskHandle_t s_task;
+static volatile bool s_running;
+static portMUX_TYPE s_stats_lock = portMUX_INITIALIZER_UNLOCKED;
+static nts_ke_stats_t s_stats;
 
-    uint8_t *certificate_pem;
-    size_t certificate_pem_len;
-
-    uint8_t *private_key_pem;
-    size_t private_key_pem_len;
-
-    bool initialized;
-} nts_ke_server_context_t;
-
-static nts_ke_server_context_t s_server_context;
-static TaskHandle_t s_nts_ke_task;
-
-static uint16_t read_u16_be(
-    const uint8_t *source)
+static void stats_increment(uint32_t *counter)
 {
-    return (uint16_t)(
-        ((uint16_t)source[0] << 8) |
-        source[1]);
+    portENTER_CRITICAL(&s_stats_lock);
+    (*counter)++;
+    portEXIT_CRITICAL(&s_stats_lock);
 }
 
-static void write_u16_be(
-    uint8_t *destination,
-    uint16_t value)
+void nts_ke_get_stats(nts_ke_stats_t *stats)
 {
-    destination[0] = (uint8_t)(value >> 8);
-    destination[1] = (uint8_t)value;
+    if (stats == NULL) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_stats_lock);
+    *stats = s_stats;
+    stats->running = s_running;
+    portEXIT_CRITICAL(&s_stats_lock);
 }
 
-static uint64_t nts_ke_current_ntp_seconds(void)
+static uint16_t read_u16(const uint8_t *p)
 {
-    ntp_timestamp_t timestamp;
-
-    app_state_get_ntp_timestamp(&timestamp);
-
-    return timestamp.seconds;
+    return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
 }
 
-static void nts_ke_zero_free(
-    uint8_t *buffer,
-    size_t length)
+static void write_u16(uint8_t *p, uint16_t value)
 {
-    if (buffer != NULL) {
-        key_store_zeroize(buffer, length);
-        free(buffer);
-    }
+    p[0] = (uint8_t)(value >> 8);
+    p[1] = (uint8_t)(value & 0xFFU);
 }
 
-static int nts_ke_bio_send(
-    void *context,
-    const unsigned char *buffer,
-    size_t length)
+static esp_err_t append_record(uint8_t *buffer,
+                               size_t buffer_size,
+                               size_t *used,
+                               uint16_t type,
+                               bool critical,
+                               const uint8_t *body,
+                               size_t body_len)
 {
-    nts_ke_bio_context_t *bio =
-        (nts_ke_bio_context_t *)context;
-
-    if (bio == NULL ||
-        bio->socket_fd < 0) {
-        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
-    }
-
-    int result = send(
-        bio->socket_fd,
-        buffer,
-        length,
-        0);
-
-    if (result >= 0) {
-        return result;
-    }
-
-    if (errno == EAGAIN ||
-        errno == EWOULDBLOCK) {
-        return MBEDTLS_ERR_SSL_WANT_WRITE;
-    }
-
-    return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
-}
-
-static int nts_ke_bio_recv(
-    void *context,
-    unsigned char *buffer,
-    size_t length)
-{
-    nts_ke_bio_context_t *bio =
-        (nts_ke_bio_context_t *)context;
-
-    if (bio == NULL ||
-        bio->socket_fd < 0) {
-        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
-    }
-
-    int result = recv(
-        bio->socket_fd,
-        buffer,
-        length,
-        0);
-
-    if (result > 0) {
-        return result;
-    }
-
-    if (result == 0) {
-        return MBEDTLS_ERR_SSL_CONN_EOF;
-    }
-
-    if (errno == EAGAIN ||
-        errno == EWOULDBLOCK) {
-        return MBEDTLS_ERR_SSL_WANT_READ;
-    }
-
-    return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
-}
-
-static int nts_ke_ssl_read_exact(
-    mbedtls_ssl_context *ssl,
-    uint8_t *buffer,
-    size_t length)
-{
-    size_t offset = 0U;
-
-    while (offset < length) {
-        int result = mbedtls_ssl_read(
-            ssl,
-            &buffer[offset],
-            length - offset);
-
-        if (result == MBEDTLS_ERR_SSL_WANT_READ ||
-            result == MBEDTLS_ERR_SSL_WANT_WRITE) {
-            continue;
-        }
-
-        if (result <= 0) {
-            return result;
-        }
-
-        offset += (size_t)result;
-    }
-
-    return 0;
-}
-
-static int nts_ke_ssl_write_all(
-    mbedtls_ssl_context *ssl,
-    const uint8_t *buffer,
-    size_t length)
-{
-    size_t offset = 0U;
-
-    while (offset < length) {
-        int result = mbedtls_ssl_write(
-            ssl,
-            &buffer[offset],
-            length - offset);
-
-        if (result == MBEDTLS_ERR_SSL_WANT_READ ||
-            result == MBEDTLS_ERR_SSL_WANT_WRITE) {
-            continue;
-        }
-
-        if (result <= 0) {
-            return result;
-        }
-
-        offset += (size_t)result;
-    }
-
-    return 0;
-}
-
-static int nts_ke_read_record(
-    mbedtls_ssl_context *ssl,
-    uint16_t *record_type,
-    uint8_t *payload,
-    size_t payload_capacity,
-    size_t *payload_length)
-{
-    uint8_t header[4];
-
-    int result = nts_ke_ssl_read_exact(
-        ssl,
-        header,
-        sizeof(header));
-
-    if (result != 0) {
-        return result;
-    }
-
-    *record_type = read_u16_be(&header[0]);
-
-    uint16_t record_length =
-        read_u16_be(&header[2]);
-
-    if (record_length > payload_capacity) {
-        return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
-    }
-
-    if (record_length > 0U) {
-        result = nts_ke_ssl_read_exact(
-            ssl,
-            payload,
-            record_length);
-
-        if (result != 0) {
-            return result;
-        }
-    }
-
-    *payload_length = record_length;
-
-    return 0;
-}
-
-static int nts_ke_write_record(
-    mbedtls_ssl_context *ssl,
-    uint16_t record_type,
-    const uint8_t *payload,
-    size_t payload_length)
-{
-    if (payload_length > UINT16_MAX) {
-        return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
-    }
-
-    uint8_t header[4];
-
-    write_u16_be(&header[0], record_type);
-    write_u16_be(&header[2],
-                 (uint16_t)payload_length);
-
-    int result = nts_ke_ssl_write_all(
-        ssl,
-        header,
-        sizeof(header));
-
-    if (result != 0) {
-        return result;
-    }
-
-    if (payload_length > 0U) {
-        result = nts_ke_ssl_write_all(
-            ssl,
-            payload,
-            payload_length);
-    }
-
-    return result;
-}
-
-static esp_err_t nts_ke_load_blob(
-    esp_err_t (*loader)(uint8_t *, size_t *),
-    uint8_t **buffer,
-    size_t *buffer_length,
-    size_t maximum_length)
-{
-    if (loader == NULL ||
-        buffer == NULL ||
-        buffer_length == NULL) {
+    if (buffer == NULL || used == NULL ||
+        body_len > UINT16_MAX ||
+        (body_len > 0U && body == NULL)) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    *buffer = NULL;
-    *buffer_length = 0U;
-
-    size_t required_length = 0U;
-
-    esp_err_t err = loader(
-        NULL,
-        &required_length);
-
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    if (required_length == 0U ||
-        required_length >= maximum_length) {
+    if (*used > buffer_size || body_len + 4U > buffer_size - *used) {
         return ESP_ERR_INVALID_SIZE;
     }
 
-    uint8_t *allocated =
-        calloc(1U, required_length + 1U);
-
-    if (allocated == NULL) {
-        return ESP_ERR_NO_MEM;
+    uint16_t wire_type = (uint16_t)(type & 0x7FFFU);
+    if (critical) {
+        wire_type |= NTS_KE_CRITICAL_BIT;
     }
 
-    size_t loaded_length =
-        required_length;
+    write_u16(buffer + *used, wire_type);
+    write_u16(buffer + *used + 2U, (uint16_t)body_len);
+    *used += 4U;
 
-    err = loader(
-        allocated,
-        &loaded_length);
-
-    if (err != ESP_OK) {
-        nts_ke_zero_free(
-            allocated,
-            required_length + 1U);
-
-        return err;
+    if (body_len > 0U) {
+        memcpy(buffer + *used, body, body_len);
+        *used += body_len;
     }
-
-    allocated[loaded_length] = '\0';
-
-    *buffer = allocated;
-    *buffer_length = loaded_length;
 
     return ESP_OK;
 }
 
-static esp_err_t nts_ke_export_traffic_keys(
-    mbedtls_ssl_context *ssl,
-    nts_cookie_keys_t *keys)
+static bool list_contains_u16(const uint8_t *body,
+                              size_t body_len,
+                              uint16_t wanted)
 {
-    if (ssl == NULL ||
-        keys == NULL) {
+    if (body == NULL || body_len == 0U || (body_len & 1U) != 0U) {
+        return false;
+    }
+
+    for (size_t offset = 0U; offset < body_len; offset += 2U) {
+        if (read_u16(body + offset) == wanted) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static esp_err_t parse_request(const uint8_t *request,
+                               size_t request_len,
+                               nts_ke_request_state_t *state)
+{
+    if (request == NULL || state == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    int result =
-        mbedtls_ssl_export_keying_material(
-            ssl,
-            keys->c2s_key,
-            NTS_TRAFFIC_KEY_LEN,
-            NTS_EXPORTER_LABEL,
-            sizeof(NTS_EXPORTER_LABEL) - 1U,
-            NTS_C2S_CONTEXT,
-            sizeof(NTS_C2S_CONTEXT),
-            1);
+    memset(state, 0, sizeof(*state));
 
-    if (result != 0) {
-        key_store_zeroize(
-            keys->c2s_key,
-            sizeof(keys->c2s_key));
+    size_t offset = 0U;
 
-        key_store_zeroize(
-            keys->s2c_key,
-            sizeof(keys->s2c_key));
+    while (offset + 4U <= request_len) {
+        const uint16_t wire_type = read_u16(request + offset);
+        const bool critical = (wire_type & NTS_KE_CRITICAL_BIT) != 0U;
+        const uint16_t type = (uint16_t)(wire_type & 0x7FFFU);
+        const uint16_t body_len = read_u16(request + offset + 2U);
+        offset += 4U;
 
-        return ESP_FAIL;
-    }
-
-    result =
-        mbedtls_ssl_export_keying_material(
-            ssl,
-            keys->s2c_key,
-            NTS_TRAFFIC_KEY_LEN,
-            NTS_EXPORTER_LABEL,
-            sizeof(NTS_EXPORTER_LABEL) - 1U,
-            NTS_S2C_CONTEXT,
-            sizeof(NTS_S2C_CONTEXT),
-            1);
-
-    if (result != 0) {
-        key_store_zeroize(
-            keys->c2s_key,
-            sizeof(keys->c2s_key));
-
-        key_store_zeroize(
-            keys->s2c_key,
-            sizeof(keys->s2c_key));
-
-        return ESP_FAIL;
-    }
-
-    return ESP_OK;
-}
-
-static int nts_ke_parse_client_records(
-    mbedtls_ssl_context *ssl)
-{
-    bool protocol_supported = false;
-    bool aead_supported = false;
-    bool end_received = false;
-
-    uint8_t next_protocol_records = 0U;
-    uint8_t aead_records = 0U;
-
-    uint8_t payload[NTS_KE_MAX_RECORD_LENGTH];
-
-    while (!end_received) {
-        uint16_t record_type = 0U;
-        size_t payload_length = 0U;
-
-        int result = nts_ke_read_record(
-            ssl,
-            &record_type,
-            payload,
-            sizeof(payload),
-            &payload_length);
-
-        if (result != 0) {
-            return result;
+        if ((size_t)body_len > request_len - offset) {
+            state->protocol_error = NTS_KE_ERROR_BAD_REQUEST;
+            return ESP_ERR_INVALID_RESPONSE;
         }
 
-        bool critical =
-            (record_type & NTS_KE_CRITICAL_BIT) != 0U;
-
-        uint16_t type =
-            record_type & ~NTS_KE_CRITICAL_BIT;
+        const uint8_t *body = request + offset;
 
         switch (type) {
         case NTS_KE_RECORD_END_OF_MESSAGE:
-            if (!critical ||
-                payload_length != 0U) {
-                return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
+            if (!critical || body_len != 0U || state->end_seen) {
+                state->protocol_error = NTS_KE_ERROR_BAD_REQUEST;
+                return ESP_ERR_INVALID_RESPONSE;
             }
-
-            end_received = true;
+            state->end_seen = true;
+            offset += body_len;
+            if (offset != request_len) {
+                state->protocol_error = NTS_KE_ERROR_BAD_REQUEST;
+                return ESP_ERR_INVALID_RESPONSE;
+            }
             break;
 
         case NTS_KE_RECORD_NEXT_PROTOCOL:
-            next_protocol_records++;
-
-            if (next_protocol_records != 1U ||
-                !critical ||
-                payload_length == 0U ||
-                (payload_length & 0x01U) != 0U) {
-                return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
+            if (!critical || state->next_protocol_seen ||
+                body_len == 0U || (body_len & 1U) != 0U) {
+                state->protocol_error = NTS_KE_ERROR_BAD_REQUEST;
+                return ESP_ERR_INVALID_RESPONSE;
             }
-
-            for (size_t i = 0U;
-                 i < payload_length;
-                 i += 2U) {
-                uint16_t protocol =
-                    read_u16_be(&payload[i]);
-
-                if (protocol ==
-                    NTS_KE_PROTOCOL_NTPV4) {
-                    protocol_supported = true;
-                }
-            }
+            state->next_protocol_seen = true;
+            state->ntpv4_offered =
+                list_contains_u16(body, body_len, NTS_KE_PROTOCOL_NTPV4);
+            offset += body_len;
             break;
 
         case NTS_KE_RECORD_AEAD_ALGORITHM:
-            aead_records++;
-
-            if (aead_records != 1U ||
-                !critical ||
-                payload_length == 0U ||
-                (payload_length & 0x01U) != 0U) {
-                return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
+            if (state->aead_seen ||
+                body_len == 0U || (body_len & 1U) != 0U) {
+                state->protocol_error = NTS_KE_ERROR_BAD_REQUEST;
+                return ESP_ERR_INVALID_RESPONSE;
             }
+            state->aead_seen = true;
+            state->aes_siv_offered =
+                list_contains_u16(body, body_len,
+                                  NTS_KE_AEAD_AES_SIV_CMAC_256);
+            offset += body_len;
+            break;
 
-            for (size_t i = 0U;
-                 i < payload_length;
-                 i += 2U) {
-                uint16_t algorithm =
-                    read_u16_be(&payload[i]);
+        case NTS_KE_RECORD_ERROR:
+        case NTS_KE_RECORD_WARNING:
+            state->protocol_error = NTS_KE_ERROR_BAD_REQUEST;
+            return ESP_ERR_INVALID_RESPONSE;
 
-                if (algorithm ==
-                    NTS_KE_AEAD_AES_SIV_CMAC_256) {
-                    aead_supported = true;
-                }
+        case NTS_KE_RECORD_NTP_SERVER:
+            if (body_len == 0U) {
+                state->protocol_error = NTS_KE_ERROR_BAD_REQUEST;
+                return ESP_ERR_INVALID_RESPONSE;
             }
+            offset += body_len;
+            break;
+
+        case NTS_KE_RECORD_NTP_PORT:
+            if (body_len != 2U) {
+                state->protocol_error = NTS_KE_ERROR_BAD_REQUEST;
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+            offset += body_len;
             break;
 
         default:
             if (critical) {
-                return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
+                state->protocol_error =
+                    NTS_KE_ERROR_UNRECOGNIZED_CRITICAL;
+                return ESP_ERR_NOT_SUPPORTED;
             }
+            offset += body_len;
+            break;
+        }
+
+        if (state->end_seen) {
             break;
         }
     }
 
-    if (!protocol_supported ||
-        !aead_supported ||
-        next_protocol_records != 1U ||
-        aead_records != 1U) {
-        return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
+    if (!state->end_seen ||
+        !state->next_protocol_seen ||
+        !state->ntpv4_offered ||
+        !state->aead_seen ||
+        !state->aes_siv_offered) {
+        state->protocol_error = NTS_KE_ERROR_BAD_REQUEST;
+        return ESP_ERR_INVALID_RESPONSE;
     }
 
-    return 0;
+    return ESP_OK;
 }
 
-static int nts_ke_write_server_records(
-    mbedtls_ssl_context *ssl,
-    nts_cookie_keys_t *keys)
+static esp_err_t build_error_response(uint16_t error_code,
+                                      uint8_t *response,
+                                      size_t response_size,
+                                      size_t *response_len)
 {
-    uint8_t selected_protocol[2];
-    uint8_t selected_aead[2];
-
-    write_u16_be(
-        selected_protocol,
-        NTS_KE_PROTOCOL_NTPV4);
-
-    write_u16_be(
-        selected_aead,
-        NTS_KE_AEAD_AES_SIV_CMAC_256);
-
-    int result = nts_ke_write_record(
-        ssl,
-        NTS_KE_CRITICAL_BIT |
-            NTS_KE_RECORD_NEXT_PROTOCOL,
-        selected_protocol,
-        sizeof(selected_protocol));
-
-    if (result != 0) {
-        return result;
+    if (response == NULL || response_len == NULL) {
+        return ESP_ERR_INVALID_ARG;
     }
 
-    result = nts_ke_write_record(
-        ssl,
-        NTS_KE_CRITICAL_BIT |
-            NTS_KE_RECORD_AEAD_ALGORITHM,
-        selected_aead,
-        sizeof(selected_aead));
+    *response_len = 0U;
 
-    if (result != 0) {
-        return result;
+    uint8_t error_body[2];
+    write_u16(error_body, error_code);
+
+    esp_err_t err = append_record(response, response_size, response_len,
+                                  NTS_KE_RECORD_ERROR, true,
+                                  error_body, sizeof(error_body));
+    if (err != ESP_OK) {
+        return err;
     }
 
-    for (uint32_t i = 0U;
-         i < APP_NTS_MAX_COOKIE_COUNT;
-         i++) {
+    return append_record(response, response_size, response_len,
+                         NTS_KE_RECORD_END_OF_MESSAGE, true,
+                         NULL, 0U);
+}
+
+static esp_err_t export_traffic_keys(mbedtls_ssl_context *ssl,
+                                     nts_cookie_keys_t *keys)
+{
+    if (ssl == NULL || keys == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(keys, 0, sizeof(*keys));
+
+    int ret = mbedtls_ssl_export_keying_material(
+        ssl,
+        keys->c2s_key,
+        sizeof(keys->c2s_key),
+        NTS_EXPORTER_LABEL,
+        sizeof(NTS_EXPORTER_LABEL) - 1U,
+        NTS_C2S_CONTEXT,
+        sizeof(NTS_C2S_CONTEXT),
+        1);
+
+    if (ret != 0) {
+        nts_storage_zeroize(keys, sizeof(*keys));
+        ESP_LOGE(TAG, "C2S TLS exporter failed: -0x%x", -ret);
+        return ESP_FAIL;
+    }
+
+    ret = mbedtls_ssl_export_keying_material(
+        ssl,
+        keys->s2c_key,
+        sizeof(keys->s2c_key),
+        NTS_EXPORTER_LABEL,
+        sizeof(NTS_EXPORTER_LABEL) - 1U,
+        NTS_S2C_CONTEXT,
+        sizeof(NTS_S2C_CONTEXT),
+        1);
+
+    if (ret != 0) {
+        nts_storage_zeroize(keys, sizeof(*keys));
+        ESP_LOGE(TAG, "S2C TLS exporter failed: -0x%x", -ret);
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t build_success_response(mbedtls_ssl_context *ssl,
+                                        uint8_t *response,
+                                        size_t response_size,
+                                        size_t *response_len)
+{
+    if (ssl == NULL || response == NULL || response_len == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *response_len = 0U;
+
+    nts_cookie_keys_t keys;
+    esp_err_t err = export_traffic_keys(ssl, &keys);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    nts_cookie_keys_t metadata;
+    err = nts_cookie_generate_keys(&metadata,
+                                   NTS_KE_COOKIE_LIFETIME_SECONDS);
+    if (err != ESP_OK) {
+        nts_storage_zeroize(&keys, sizeof(keys));
+        return err;
+    }
+
+    keys.master_key_id = metadata.master_key_id;
+    keys.issued_ntp_seconds = metadata.issued_ntp_seconds;
+    keys.expires_ntp_seconds = metadata.expires_ntp_seconds;
+    nts_storage_zeroize(metadata.c2s_key, sizeof(metadata.c2s_key));
+    nts_storage_zeroize(metadata.s2c_key, sizeof(metadata.s2c_key));
+    nts_storage_zeroize(&metadata, sizeof(metadata));
+
+    const uint8_t protocol_body[2] = {0x00U, 0x00U};
+    const uint8_t aead_body[2] = {0x00U, 0x0FU};
+
+    err = append_record(response, response_size, response_len,
+                        NTS_KE_RECORD_NEXT_PROTOCOL, true,
+                        protocol_body, sizeof(protocol_body));
+    if (err == ESP_OK) {
+        err = append_record(response, response_size, response_len,
+                            NTS_KE_RECORD_AEAD_ALGORITHM, false,
+                            aead_body, sizeof(aead_body));
+    }
+
+    for (unsigned i = 0U; err == ESP_OK && i < NTS_KE_COOKIE_COUNT; ++i) {
         uint8_t cookie[NTS_COOKIE_MAX_LEN];
+        size_t cookie_len = sizeof(cookie);
 
-        size_t cookie_length =
-            sizeof(cookie);
-
-        uint64_t now_ntp =
-            nts_ke_current_ntp_seconds();
-
-        keys->issued_ntp_seconds =
-            now_ntp;
-
-        keys->expires_ntp_seconds =
-            now_ntp +
-            APP_NTS_COOKIE_LIFETIME_SECONDS;
-
-        esp_err_t err = nts_cookie_create(
-            keys,
-            cookie,
-            &cookie_length);
-
-        if (err != ESP_OK) {
-            key_store_zeroize(
-                cookie,
-                sizeof(cookie));
-
-            return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+        err = nts_cookie_create(&keys, cookie, &cookie_len);
+        if (err == ESP_OK) {
+            err = append_record(response, response_size, response_len,
+                                NTS_KE_RECORD_NEW_COOKIE, false,
+                                cookie, cookie_len);
         }
 
-        result = nts_ke_write_record(
-            ssl,
-            NTS_KE_RECORD_NEW_COOKIE,
-            cookie,
-            cookie_length);
-
-        key_store_zeroize(
-            cookie,
-            sizeof(cookie));
-
-        if (result != 0) {
-            return result;
-        }
+        nts_storage_zeroize(cookie, sizeof(cookie));
     }
 
-    return nts_ke_write_record(
-        ssl,
-        NTS_KE_CRITICAL_BIT |
-            NTS_KE_RECORD_END_OF_MESSAGE,
-        NULL,
-        0U);
+    if (err == ESP_OK) {
+        err = append_record(response, response_size, response_len,
+                            NTS_KE_RECORD_END_OF_MESSAGE, true,
+                            NULL, 0U);
+    }
+
+    nts_storage_zeroize(&keys, sizeof(keys));
+    return err;
 }
 
-static void nts_ke_handle_client(
-    int client_socket)
+static esp_err_t tls_write_all(mbedtls_ssl_context *ssl,
+                               const uint8_t *data,
+                               size_t length)
 {
-    nts_ke_bio_context_t bio = {
-        .socket_fd = client_socket,
-    };
+    size_t sent = 0U;
 
+    while (sent < length) {
+        const int ret = mbedtls_ssl_write(ssl, data + sent, length - sent);
+
+        if (ret > 0) {
+            sent += (size_t)ret;
+            continue;
+        }
+
+        if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
+            ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            continue;
+        }
+
+        ESP_LOGE(TAG, "TLS write failed: -0x%x", -ret);
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t tls_read_request(mbedtls_ssl_context *ssl,
+                                  uint8_t *request,
+                                  size_t request_size,
+                                  size_t *request_len)
+{
+    if (ssl == NULL || request == NULL || request_len == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *request_len = 0U;
+
+    while (*request_len < request_size) {
+        const int ret = mbedtls_ssl_read(
+            ssl,
+            request + *request_len,
+            request_size - *request_len);
+
+        if (ret > 0) {
+            *request_len += (size_t)ret;
+
+            size_t offset = 0U;
+            while (offset + 4U <= *request_len) {
+                const uint16_t wire_type = read_u16(request + offset);
+                const uint16_t type = (uint16_t)(wire_type & 0x7FFFU);
+                const uint16_t body_len = read_u16(request + offset + 2U);
+
+                if ((size_t)body_len > *request_len - offset - 4U) {
+                    break;
+                }
+
+                offset += 4U + (size_t)body_len;
+
+                if (type == NTS_KE_RECORD_END_OF_MESSAGE) {
+                    if (offset != *request_len) {
+                        return ESP_ERR_INVALID_RESPONSE;
+                    }
+                    return ESP_OK;
+                }
+            }
+
+            continue;
+        }
+
+        if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
+            ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            continue;
+        }
+
+        if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+
+        ESP_LOGW(TAG, "TLS read failed: -0x%x", -ret);
+        return ESP_FAIL;
+    }
+
+    return ESP_ERR_INVALID_SIZE;
+}
+
+static void close_tls_session(mbedtls_ssl_context *ssl)
+{
+    if (ssl == NULL) {
+        return;
+    }
+
+    int ret;
+    do {
+        ret = mbedtls_ssl_close_notify(ssl);
+    } while (ret == MBEDTLS_ERR_SSL_WANT_READ ||
+             ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+}
+
+static void handle_client(mbedtls_net_context *client,
+                          mbedtls_ssl_config *config)
+{
     mbedtls_ssl_context ssl;
     mbedtls_ssl_init(&ssl);
 
-    int result = mbedtls_ssl_setup(
-        &ssl,
-        &s_server_context.ssl_config);
-
-    if (result != 0) {
+    int ret = mbedtls_ssl_setup(&ssl, config);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "mbedtls_ssl_setup failed: -0x%x", -ret);
         mbedtls_ssl_free(&ssl);
-        close(client_socket);
         return;
     }
 
-    mbedtls_ssl_set_bio(
-        &ssl,
-        &bio,
-        nts_ke_bio_send,
-        nts_ke_bio_recv,
-        NULL);
+    mbedtls_ssl_set_bio(&ssl, client,
+                        mbedtls_net_send,
+                        mbedtls_net_recv,
+                        mbedtls_net_recv_timeout);
 
-    while (true) {
-        result = mbedtls_ssl_handshake(&ssl);
-
-        if (result == 0) {
-            break;
-        }
-
-        if (result == MBEDTLS_ERR_SSL_WANT_READ ||
-            result == MBEDTLS_ERR_SSL_WANT_WRITE) {
+    while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
+        if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
+            ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
             continue;
         }
 
-        ESP_LOGW(TAG,
-                 "TLS handshake failed: %d",
-                 result);
-
+        ESP_LOGW(TAG, "TLS handshake failed: -0x%x", -ret);
+        stats_increment(&s_stats.tls_handshake_failures);
         mbedtls_ssl_free(&ssl);
-        close(client_socket);
         return;
     }
 
-    const char *tls_version =
-        mbedtls_ssl_get_version(&ssl);
-
-    if (tls_version == NULL ||
-        strcmp(tls_version, "TLSv1.3") != 0) {
-        ESP_LOGW(TAG,
-                 "NTS-KE rejected non-TLS-1.3 client");
-
-        (void)mbedtls_ssl_close_notify(&ssl);
+    const char *alpn = mbedtls_ssl_get_alpn_protocol(&ssl);
+    if (alpn == NULL || strcmp(alpn, "ntske/1") != 0) {
+        ESP_LOGW(TAG, "Rejecting connection without ntske/1 ALPN");
+        stats_increment(&s_stats.alpn_rejections);
+        close_tls_session(&ssl);
         mbedtls_ssl_free(&ssl);
-        close(client_socket);
         return;
     }
 
-    const char *alpn =
-        mbedtls_ssl_get_alpn_protocol(&ssl);
+    uint8_t request[NTS_KE_REQUEST_MAX];
+    size_t request_len = 0U;
+    esp_err_t err = tls_read_request(&ssl, request, sizeof(request),
+                                     &request_len);
 
-    if (alpn == NULL ||
-        strcmp(alpn, "ntske/1") != 0) {
-        ESP_LOGW(TAG,
-                 "NTS-KE ALPN negotiation failed");
+    uint8_t response[NTS_KE_RESPONSE_MAX];
+    size_t response_len = 0U;
 
-        (void)mbedtls_ssl_close_notify(&ssl);
-        mbedtls_ssl_free(&ssl);
-        close(client_socket);
-        return;
+    if (err == ESP_OK) {
+        nts_ke_request_state_t state;
+        err = parse_request(request, request_len, &state);
+
+        if (err == ESP_OK) {
+            err = build_success_response(&ssl, response,
+                                         sizeof(response),
+                                         &response_len);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "NTS-KE response construction failed: %s",
+                         esp_err_to_name(err));
+                (void)build_error_response(
+                    NTS_KE_ERROR_INTERNAL_SERVER,
+                    response, sizeof(response), &response_len);
+            }
+        } else {
+            const uint16_t protocol_error =
+                state.protocol_error <= NTS_KE_ERROR_INTERNAL_SERVER
+                    ? state.protocol_error
+                    : NTS_KE_ERROR_BAD_REQUEST;
+            (void)build_error_response(protocol_error,
+                                       response, sizeof(response),
+                                       &response_len);
+        }
+    } else {
+        (void)build_error_response(NTS_KE_ERROR_BAD_REQUEST,
+                                   response, sizeof(response),
+                                   &response_len);
     }
 
-    result = nts_ke_parse_client_records(&ssl);
+    if (response_len > 0U) {
+        const esp_err_t write_err =
+            tls_write_all(&ssl, response, response_len);
 
-    if (result != 0) {
-        ESP_LOGW(TAG,
-                 "Invalid NTS-KE record sequence");
-
-        (void)mbedtls_ssl_close_notify(&ssl);
-        mbedtls_ssl_free(&ssl);
-        close(client_socket);
-        return;
+        if (write_err == ESP_OK) {
+            stats_increment(&s_stats.exchanges_completed);
+            ESP_LOGI(TAG,
+                     "NTS-KE exchange complete: request=%u response=%u",
+                     (unsigned)request_len,
+                     (unsigned)response_len);
+        } else {
+            stats_increment(&s_stats.exchange_failures);
+        }
+    } else {
+        stats_increment(&s_stats.exchange_failures);
     }
 
-    nts_cookie_keys_t traffic_keys;
-    memset(&traffic_keys, 0, sizeof(traffic_keys));
+    nts_storage_zeroize(request, sizeof(request));
+    nts_storage_zeroize(response, sizeof(response));
 
-    esp_err_t err = nts_ke_export_traffic_keys(
-        &ssl,
-        &traffic_keys);
-
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG,
-                 "NTS exporter failed");
-
-        key_store_zeroize(
-            &traffic_keys,
-            sizeof(traffic_keys));
-
-        (void)mbedtls_ssl_close_notify(&ssl);
-        mbedtls_ssl_free(&ssl);
-        close(client_socket);
-        return;
-    }
-
-    result = nts_ke_write_server_records(
-        &ssl,
-        &traffic_keys);
-
-    key_store_zeroize(
-        &traffic_keys,
-        sizeof(traffic_keys));
-
-    if (result != 0) {
-        ESP_LOGW(TAG,
-                 "NTS-KE response write failed: %d",
-                 result);
-    }
-
-    (void)mbedtls_ssl_close_notify(&ssl);
-
+    close_tls_session(&ssl);
     mbedtls_ssl_free(&ssl);
-
-    close(client_socket);
 }
 
-static void nts_ke_server_task(void *arg)
+static esp_err_t configure_tls(mbedtls_ssl_config *config,
+                               mbedtls_x509_crt *certificate,
+                               mbedtls_pk_context *private_key)
 {
-    (void)arg;
+    acme_tls_credentials_t credentials;
+    memset(&credentials, 0, sizeof(credentials));
 
-    int listen_socket = socket(
-        AF_INET,
-        SOCK_STREAM,
-        IPPROTO_IP);
-
-    if (listen_socket < 0) {
-        ESP_LOGE(TAG,
-                 "NTS-KE socket creation failed");
-
-        vTaskDelete(NULL);
-        return;
-    }
-
-    struct sockaddr_in server_address = {
-        .sin_family = AF_INET,
-        .sin_port = htons(APP_NTS_KE_PORT),
-        .sin_addr.s_addr = htonl(INADDR_ANY),
-    };
-
-    if (bind(listen_socket,
-             (struct sockaddr *)&server_address,
-             sizeof(server_address)) != 0) {
-        ESP_LOGE(TAG,
-                 "NTS-KE bind failed: errno=%d",
-                 errno);
-
-        close(listen_socket);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    if (listen(listen_socket, 2) != 0) {
-        ESP_LOGE(TAG,
-                 "NTS-KE listen failed: errno=%d",
-                 errno);
-
-        close(listen_socket);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TAG,
-             "NTS-KE listening on TCP %u",
-             APP_NTS_KE_PORT);
-
-    while (true) {
-        struct sockaddr_in client_address = {0};
-
-        socklen_t client_length =
-            sizeof(client_address);
-
-        int client_socket = accept(
-            listen_socket,
-            (struct sockaddr *)&client_address,
-            &client_length);
-
-        if (client_socket < 0) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-
-        nts_ke_handle_client(client_socket);
-    }
-}
-
-esp_err_t nts_ke_start(void)
-{
-    if (s_server_context.initialized) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    esp_err_t err = key_store_init();
-
+    esp_err_t err =
+        acme_client_load_production_tls_credentials(&credentials);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Production TLS credential load failed: %s",
+                 esp_err_to_name(err));
         return err;
     }
 
-    err = key_store_ensure_cookie_keyring();
+    int ret = mbedtls_x509_crt_parse(
+        certificate,
+        (const unsigned char *)credentials.certificate_pem,
+        credentials.certificate_pem_length + 1U);
 
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    err = nts_aes_siv_init();
-
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    psa_status_t psa_result = psa_crypto_init();
-
-    if (psa_result != PSA_SUCCESS) {
+    if (ret < 0) {
+        ESP_LOGE(TAG, "Production certificate parse failed: -0x%x", -ret);
+        acme_client_free_tls_credentials(&credentials);
         return ESP_FAIL;
     }
 
-    /* Remaining nts_ke_start() code continues here. */
+    ret = mbedtls_pk_parse_key(
+    private_key,
+    (const unsigned char *)credentials.private_key_pem,
+    credentials.private_key_pem_length,
+    NULL,
+    0U);
 
-    memset(&s_server_context,
-           0,
-           sizeof(s_server_context));
+    acme_client_free_tls_credentials(&credentials);
 
-    mbedtls_x509_crt_init(
-        &s_server_context.certificate_chain);
-
-    mbedtls_pk_init(
-        &s_server_context.private_key);
-
-    mbedtls_ssl_config_init(
-        &s_server_context.ssl_config);
-
- /*   err = nts_ke_load_blob(
-  *      key_store_load_tls_certificate,
-  *      &s_server_context.certificate_pem,
-  *      &s_server_context.certificate_pem_len,
-  *      NTS_KE_CERT_MAX_LENGTH);
-  *
-  * if (err != ESP_OK) {
-  *      return err;
-  *  }
-  */
-	err = nts_ke_load_blob(
-		key_store_load_tls_private_key,
-		&s_server_context.private_key_pem,
-		&s_server_context.private_key_pem_len,
-		NTS_KE_KEY_MAX_LENGTH);
-
-	if (err != ESP_OK) {
-		ESP_LOGE(TAG,
-				 "Missing NVS blob: tls_server_key (%s)",
-				 esp_err_to_name(err));
-
-		return err;
-	}
- /*   err = nts_ke_load_blob(
-  *      key_store_load_tls_private_key,
-  *      &s_server_context.private_key_pem,
-  *      &s_server_context.private_key_pem_len,
-  *      NTS_KE_KEY_MAX_LENGTH);
-  *
-  *  if (err != ESP_OK) {
-  *      nts_ke_zero_free(
-  *          s_server_context.certificate_pem,
-  *          s_server_context.certificate_pem_len + 1U);
-  *
-  *      return err;
-  *  }
-  */
-    int result = mbedtls_x509_crt_parse(
-        &s_server_context.certificate_chain,
-        s_server_context.certificate_pem,
-        s_server_context.certificate_pem_len + 1U);
-
-    if (result != 0) {
+    if (ret != 0) {
+        ESP_LOGE(TAG, "Production private-key parse failed: -0x%x", -ret);
         return ESP_FAIL;
     }
 
-    result = mbedtls_pk_parse_key(
-        &s_server_context.private_key,
-        s_server_context.private_key_pem,
-        s_server_context.private_key_pem_len + 1U,
-        NULL,
-        0U);
-
-    if (result != 0) {
-        return ESP_FAIL;
-    }
-
-    result = mbedtls_ssl_config_defaults(
-        &s_server_context.ssl_config,
+    ret = mbedtls_ssl_config_defaults(
+        config,
         MBEDTLS_SSL_IS_SERVER,
         MBEDTLS_SSL_TRANSPORT_STREAM,
         MBEDTLS_SSL_PRESET_DEFAULT);
 
-    if (result != 0) {
+    if (ret != 0) {
+        ESP_LOGE(TAG, "TLS configuration defaults failed: -0x%x", -ret);
         return ESP_FAIL;
     }
 
-    mbedtls_ssl_conf_authmode(
-        &s_server_context.ssl_config,
-        MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_min_tls_version(config, MBEDTLS_SSL_VERSION_TLS1_3);
+    mbedtls_ssl_conf_max_tls_version(config, MBEDTLS_SSL_VERSION_TLS1_3);
+    mbedtls_ssl_conf_authmode(config, MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_read_timeout(config, 10000U);
 
-    result = mbedtls_ssl_conf_alpn_protocols(
-        &s_server_context.ssl_config,
-        NTS_ALPN_PROTOCOLS);
-
-    if (result != 0) {
+    ret = mbedtls_ssl_conf_alpn_protocols(config, NTS_ALPN_PROTOCOLS);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "ALPN configuration failed: -0x%x", -ret);
         return ESP_FAIL;
     }
 
-    result = mbedtls_ssl_conf_own_cert(
-        &s_server_context.ssl_config,
-        &s_server_context.certificate_chain,
-        &s_server_context.private_key);
-
-    if (result != 0) {
+    ret = mbedtls_ssl_conf_own_cert(config, certificate, private_key);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "Server certificate configuration failed: -0x%x",
+                 -ret);
         return ESP_FAIL;
     }
 
-    s_server_context.initialized = true;
+    return ESP_OK;
+}
 
-    BaseType_t task_result = xTaskCreate(
-        nts_ke_server_task,
+static void nts_ke_task(void *arg)
+{
+    (void)arg;
+
+    mbedtls_net_context listener;
+    mbedtls_net_init(&listener);
+
+    mbedtls_ssl_config config;
+    mbedtls_ssl_config_init(&config);
+
+    mbedtls_x509_crt certificate;
+    mbedtls_x509_crt_init(&certificate);
+
+    mbedtls_pk_context private_key;
+    mbedtls_pk_init(&private_key);
+
+    esp_err_t err = nts_storage_ensure_cookie_keyring();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Cookie keyring unavailable: %s",
+                 esp_err_to_name(err));
+        goto exit;
+    }
+
+    err = configure_tls(&config, &certificate, &private_key);
+    if (err != ESP_OK) {
+        goto exit;
+    }
+
+    int ret = mbedtls_net_bind(
+        &listener, NULL, NTS_KE_PORT, MBEDTLS_NET_PROTO_TCP);
+
+    if (ret != 0) {
+        ESP_LOGE(TAG, "TCP/%s bind failed: -0x%x", NTS_KE_PORT, -ret);
+        goto exit;
+    }
+
+    s_running = true;
+    ESP_LOGI(TAG,
+             "NTS-KE active on TCP/%s; TLS 1.3; ALPN=ntske/1; production ACME credential",
+             NTS_KE_PORT);
+
+    for (;;) {
+        mbedtls_net_context client;
+        mbedtls_net_init(&client);
+
+        ret = mbedtls_net_accept(&listener, &client, NULL, 0U, NULL);
+        if (ret != 0) {
+            ESP_LOGW(TAG, "TCP accept failed: -0x%x", -ret);
+            mbedtls_net_free(&client);
+            continue;
+        }
+
+        handle_client(&client, &config);
+        mbedtls_net_free(&client);
+    }
+
+exit:
+    s_running = false;
+    s_task = NULL;
+
+    mbedtls_net_free(&listener);
+    mbedtls_pk_free(&private_key);
+    mbedtls_x509_crt_free(&certificate);
+    mbedtls_ssl_config_free(&config);
+
+    vTaskDelete(NULL);
+}
+
+esp_err_t nts_ke_start(void)
+{
+    if (s_task != NULL || s_running) {
+        return ESP_OK;
+    }
+
+    BaseType_t created = xTaskCreate(
+        nts_ke_task,
         "nts_ke",
         NTS_KE_TASK_STACK_SIZE,
         NULL,
         NTS_KE_TASK_PRIORITY,
-        &s_nts_ke_task);
+        &s_task);
 
-    if (task_result != pdPASS) {
+    if (created != pdPASS) {
+        s_task = NULL;
         return ESP_ERR_NO_MEM;
     }
 
     return ESP_OK;
+}
+
+bool nts_ke_is_running(void)
+{
+    return s_running;
 }

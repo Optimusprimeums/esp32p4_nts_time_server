@@ -1,19 +1,26 @@
 #pragma once
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "esp_err.h"
 
-/*
- * Starts the RFC 8915 NTS-KE TLS service on TCP port 4460.
- *
- * Current draft intentionally fails closed until:
- * - TLS 1.3 configuration
- * - ALPN ntske/1
- * - TLS exporter key derivation
- * - AEAD negotiation
- * - NTS-KE record processing
- * - Cookie issuance
- * - interoperability testing
- *
- * are completed and tested.
- */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+    bool running;
+    uint32_t tls_handshake_failures;
+    uint32_t alpn_rejections;
+    uint32_t exchanges_completed;
+    uint32_t exchange_failures;
+} nts_ke_stats_t;
+
 esp_err_t nts_ke_start(void);
+bool nts_ke_is_running(void);
+void nts_ke_get_stats(nts_ke_stats_t *stats);
+
+#ifdef __cplusplus
+}
+#endif
