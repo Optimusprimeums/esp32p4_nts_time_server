@@ -14,6 +14,7 @@ idf_component_register(
         "ntp_packet.c"
         "ntp_rate_limit.c"
         "ntp_server.c"
+        "ntp_peer_monitor.c"
         "nts_aes_siv.c"
         "nts_storage.c"
         "nts_cookie.c"

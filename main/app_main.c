@@ -5,6 +5,7 @@
 #include "eth_service.h"
 #include "gnss_service.h"
 #include "ntp_server.h"
+#include "ntp_peer_monitor.h"
 #include "nts_ke.h"
 #include "pps_service.h"
 #include "web_console.h"
@@ -129,6 +130,15 @@ void app_main(void)
         return;
     }
 
+    const esp_err_t peer_monitor_err = ntp_peer_monitor_start();
+
+    if (peer_monitor_err != ESP_OK) {
+        /* Peer monitoring is telemetry-only and must never gate NTP service. */
+        ESP_LOGW(TAG,
+                 "NTP peer monitor did not start: %s",
+                 esp_err_to_name(peer_monitor_err));
+    }
+
     err = web_console_start();
 
     if (err != ESP_OK) {
@@ -154,6 +164,11 @@ void app_main(void)
                  esp_err_to_name(err));
     }
 
-    ESP_LOGI(TAG,
-             "Ethernet, NTP, NTS-KE, and HTTPS management services started");
+    if (peer_monitor_err == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "Ethernet, NTP, peer monitoring, NTS-KE, and HTTPS management services started");
+    } else {
+        ESP_LOGI(TAG,
+                 "Ethernet, NTP, NTS-KE, and HTTPS management services started; peer monitoring unavailable");
+    }
 }
