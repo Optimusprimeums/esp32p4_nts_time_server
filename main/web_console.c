@@ -16,6 +16,7 @@
 #include "eth_service.h"
 #include "gnss_service.h"
 #include "ntp_server.h"
+#include "ntp_peer_monitor.h"
 #include "ntp_types.h"
 #include "nts_ke.h"
 #include "nts_ntp_auth.h"
@@ -35,13 +36,13 @@
 static const char *TAG = "WEB";
 
 #define APP_WEB_CONSOLE_PORT                    443U
-#define APP_WEB_CONSOLE_STACK_SIZE              8192U
-#define APP_WEB_CONSOLE_MAX_HANDLERS            36U
-#define APP_WEB_CONFIG_BODY_MAX                  1024U
+#define APP_WEB_CONSOLE_STACK_SIZE              12288U
+#define APP_WEB_CONSOLE_MAX_HANDLERS            40U
+#define APP_WEB_CONFIG_BODY_MAX                  2048U
 #define APP_WEB_CONSOLE_MAX_OPEN_SOCKETS        4U
 #define APP_ACME_RENEWAL_CHECK_INTERVAL_MS       (6U * 60U * 60U * 1000U)
 #define APP_ACME_RENEWAL_INITIAL_DELAY_MS         30000U
-#define APP_ACME_RENEWAL_TASK_STACK_SIZE          8192U
+#define APP_ACME_RENEWAL_TASK_STACK_SIZE         12288U
 #define APP_ACME_RENEWAL_TASK_PRIORITY               4U
 #define APP_TLS_ACTIVATION_OUTCOME_RECORD_VERSION      1U
 #define APP_TLS_ACTIVATION_OUTCOME_KEY                 "tls_out"
@@ -1428,6 +1429,7 @@ static esp_err_t send_status_json(httpd_req_t *request)
     ntp_server_status_t ntp_status;
     nts_ke_stats_t nts_ke_stats;
     nts_ntp_auth_stats_t nts_auth_stats;
+    ntp_peer_monitor_status_t peer_status;
 
     (void)app_state_get_snapshot(&app_status);
     (void)clock_discipline_get_status(&clock_status);
@@ -1437,6 +1439,8 @@ static esp_err_t send_status_json(httpd_req_t *request)
     (void)ntp_server_get_status(&ntp_status);
     nts_ke_get_stats(&nts_ke_stats);
     nts_ntp_auth_get_stats(&nts_auth_stats);
+    memset(&peer_status, 0, sizeof(peer_status));
+    (void)ntp_peer_monitor_get_status(&peer_status);
 
     const esp_ip4_addr_t device_ip = {
         .addr = eth_status.ipv4_address,
@@ -1474,11 +1478,13 @@ static esp_err_t send_status_json(httpd_req_t *request)
         clock_is_servable(clock_status.state,
                           clock_status.solution_valid);
 
-    char response[4096];
+    const size_t response_size = 12288U;
+    char *response = calloc(1U, response_size);
+    if (response == NULL) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
 
-    const int length = snprintf(
+    int length = snprintf(
         response,
-        sizeof(response),
+        response_size,
         "{"
         "\"console\":{"
         "\"mode\":\"mtls_authenticated\","
@@ -1656,7 +1662,50 @@ static esp_err_t send_status_json(httpd_req_t *request)
         nts_auth_stats.protected_responses,
         nts_auth_stats.protection_failures);
 
-    if (length < 0 || length >= (int)sizeof(response)) {
+    if (length > 0 && (size_t)length < response_size && response[length - 1] == '}') {
+        response[--length] = '\0';
+        int n = snprintf(response + length, response_size - (size_t)length,
+                         ",\"peer_monitor\":{\"running\":%s,\"enabled\":%s,"
+                         "\"poll_interval_seconds\":%" PRIu32 ",\"response_timeout_ms\":%" PRIu32 ","
+                         "\"poll_cycles\":%" PRIu32 ",\"configured_peers\":%" PRIu32 ",\"healthy_peers\":%" PRIu32 ","
+                         "\"cross_peer_spread_valid\":%s,\"cross_peer_spread_ns\":%" PRId64 ","
+                         "\"best_observed_peer_valid\":%s,\"best_observed_peer_index\":%" PRIu32 ",\"peers\":[",
+                         peer_status.running ? "true" : "false", peer_status.enabled ? "true" : "false",
+                         peer_status.poll_interval_seconds, peer_status.response_timeout_ms, peer_status.poll_cycles,
+                         peer_status.configured_peers, peer_status.healthy_peers,
+                         peer_status.cross_peer_spread_valid ? "true" : "false", peer_status.cross_peer_spread_ns,
+                         peer_status.best_observed_peer_valid ? "true" : "false", peer_status.best_observed_peer_index);
+        if (n < 0 || (size_t)n >= response_size - (size_t)length) length = (int)response_size; else length += n;
+        for (size_t i = 0; i < APP_NTP_PEER_MAX_COUNT && (size_t)length < response_size; ++i) {
+            const ntp_peer_status_t *peer = &peer_status.peers[i];
+            n = snprintf(response + length, response_size - (size_t)length,
+                         "%s{\"index\":%u,\"configured\":%s,\"server\":\"%s\",\"health\":\"%s\","
+                         "\"reachability\":%u,\"stratum\":%u,\"leap\":%u,\"reference_id\":\"%s\","
+                         "\"offset_ns\":%" PRId64 ",\"delay_ns\":%" PRId64 ",\"jitter_ns\":%" PRId64 ","
+                         "\"min_offset_ns\":%" PRId64 ",\"max_offset_ns\":%" PRId64 ",\"mean_offset_ns\":%" PRId64 ",\"rms_offset_ns\":%" PRId64 ","
+                         "\"min_delay_ns\":%" PRId64 ",\"mean_delay_ns\":%" PRId64 ","
+                         "\"successful_polls\":%" PRIu32 ",\"failed_polls\":%" PRIu32 ",\"rejected_responses\":%" PRIu32 ","
+                         "\"duplicate_responses\":%" PRIu32 ",\"consecutive_failures\":%" PRIu32 ",\"kod_responses\":%" PRIu32 ","
+                         "\"dns_failures\":%" PRIu32 ",\"timeout_failures\":%" PRIu32 ",\"samples\":%" PRIu32 ","
+                         "\"rolling_samples\":%" PRIu32 ",\"last_success_age_seconds\":%" PRIu32 "}",
+                         i ? "," : "", (unsigned)i, peer->configured ? "true" : "false", peer->server,
+                         ntp_peer_monitor_health_name(peer->health), peer->reachability, peer->stratum, peer->leap, peer->reference_id,
+                         peer->offset_ns, peer->delay_ns, peer->jitter_ns, peer->min_offset_ns, peer->max_offset_ns,
+                         peer->mean_offset_ns, peer->rms_offset_ns, peer->min_delay_ns, peer->mean_delay_ns,
+                         peer->successful_polls, peer->failed_polls, peer->rejected_responses, peer->duplicate_responses,
+                         peer->consecutive_failures, peer->kod_responses, peer->dns_failures, peer->timeout_failures,
+                         peer->samples, peer->rolling_samples, peer->last_success_age_seconds);
+            if (n < 0 || (size_t)n >= response_size - (size_t)length) { length = (int)response_size; break; }
+            length += n;
+        }
+        if ((size_t)length < response_size) {
+            n = snprintf(response + length, response_size - (size_t)length, "]}}");
+            if (n < 0 || (size_t)n >= response_size - (size_t)length) length = (int)response_size; else length += n;
+        }
+    }
+
+    if (length < 0 || (size_t)length >= response_size) {
+        free(response);
         return httpd_resp_send_err(request,
                                    HTTPD_500_INTERNAL_SERVER_ERROR,
                                    "status serialization failed");
@@ -1665,9 +1714,9 @@ static esp_err_t send_status_json(httpd_req_t *request)
     httpd_resp_set_type(request, "application/json");
     set_security_headers(request);
 
-    return httpd_resp_send(request,
-                           response,
-                           HTTPD_RESP_USE_STRLEN);
+    const esp_err_t send_err = httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+    free(response);
+    return send_err;
 }
 
 static esp_err_t send_health_response(httpd_req_t *request)
@@ -1725,6 +1774,7 @@ static esp_err_t send_metrics_response(httpd_req_t *request)
     ntp_server_status_t ntp_status;
     nts_ke_stats_t nts_ke_stats;
     nts_ntp_auth_stats_t nts_auth_stats;
+    ntp_peer_monitor_status_t peer_status;
 
     (void)clock_discipline_get_status(&clock_status);
     (void)gnss_service_get_status(&gnss_status);
@@ -1733,12 +1783,16 @@ static esp_err_t send_metrics_response(httpd_req_t *request)
     (void)ntp_server_get_status(&ntp_status);
     nts_ke_get_stats(&nts_ke_stats);
     nts_ntp_auth_get_stats(&nts_auth_stats);
+    memset(&peer_status, 0, sizeof(peer_status));
+    (void)ntp_peer_monitor_get_status(&peer_status);
 
-    char response[4096];
+    const size_t response_size = 12288U;
+    char *response = calloc(1U, response_size);
+    if (response == NULL) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
 
-    const int length = snprintf(
+    int length = snprintf(
         response,
-        sizeof(response),
+        response_size,
         "# HELP esp32_ntp_clock_state Clock state enumeration.\n"
         "# TYPE esp32_ntp_clock_state gauge\n"
         "esp32_ntp_clock_state %d\n"
@@ -1829,7 +1883,44 @@ static esp_err_t send_metrics_response(httpd_req_t *request)
         nts_auth_stats.protected_responses,
         nts_auth_stats.protection_failures);
 
-    if (length < 0 || length >= (int)sizeof(response)) {
+    if (length > 0 && (size_t)length < response_size) {
+        int n = snprintf(response + length, response_size - (size_t)length,
+                         "# HELP esp32_ntp_peer_monitor_enabled Peer monitoring enabled.\n"
+                         "# TYPE esp32_ntp_peer_monitor_enabled gauge\n"
+                         "esp32_ntp_peer_monitor_enabled %d\n"
+                         "# HELP esp32_ntp_peer_cross_spread_ns Cross-peer offset spread.\n"
+                         "# TYPE esp32_ntp_peer_cross_spread_ns gauge\n"
+                         "esp32_ntp_peer_cross_spread_ns %" PRId64 "\n"
+                         "# HELP esp32_ntp_peer_poll_cycles_total Peer monitor poll cycles.\n"
+                         "# TYPE esp32_ntp_peer_poll_cycles_total counter\n"
+                         "esp32_ntp_peer_poll_cycles_total %" PRIu32 "\n",
+                         peer_status.enabled ? 1 : 0, peer_status.cross_peer_spread_ns, peer_status.poll_cycles);
+        if (n < 0 || (size_t)n >= response_size - (size_t)length) length = (int)response_size; else length += n;
+        for (size_t i = 0; i < APP_NTP_PEER_MAX_COUNT && (size_t)length < response_size; ++i) {
+            const ntp_peer_status_t *peer = &peer_status.peers[i];
+            n = snprintf(response + length, response_size - (size_t)length,
+                         "esp32_ntp_peer_configured{peer=\"%u\"} %d\n"
+                         "esp32_ntp_peer_health{peer=\"%u\"} %d\n"
+                         "esp32_ntp_peer_offset_ns{peer=\"%u\"} %" PRId64 "\n"
+                         "esp32_ntp_peer_delay_ns{peer=\"%u\"} %" PRId64 "\n"
+                         "esp32_ntp_peer_jitter_ns{peer=\"%u\"} %" PRId64 "\n"
+                         "esp32_ntp_peer_reachability{peer=\"%u\"} %u\n"
+                         "esp32_ntp_peer_successful_polls_total{peer=\"%u\"} %" PRIu32 "\n"
+                         "esp32_ntp_peer_failed_polls_total{peer=\"%u\"} %" PRIu32 "\n"
+                         "esp32_ntp_peer_rejected_responses_total{peer=\"%u\"} %" PRIu32 "\n"
+                         "esp32_ntp_peer_duplicate_responses_total{peer=\"%u\"} %" PRIu32 "\n",
+                         (unsigned)i, peer->configured ? 1 : 0, (unsigned)i, (int)peer->health,
+                         (unsigned)i, peer->offset_ns, (unsigned)i, peer->delay_ns, (unsigned)i, peer->jitter_ns,
+                         (unsigned)i, peer->reachability, (unsigned)i, peer->successful_polls,
+                         (unsigned)i, peer->failed_polls, (unsigned)i, peer->rejected_responses,
+                         (unsigned)i, peer->duplicate_responses);
+            if (n < 0 || (size_t)n >= response_size - (size_t)length) { length = (int)response_size; break; }
+            length += n;
+        }
+    }
+
+    if (length < 0 || (size_t)length >= response_size) {
+        free(response);
         return httpd_resp_send_err(request,
                                    HTTPD_500_INTERNAL_SERVER_ERROR,
                                    "metrics serialization failed");
@@ -1839,38 +1930,42 @@ static esp_err_t send_metrics_response(httpd_req_t *request)
                         "text/plain; version=0.0.4; charset=utf-8");
     set_security_headers(request);
 
-    return httpd_resp_send(request,
-                           response,
-                           HTTPD_RESP_USE_STRLEN);
+    const esp_err_t send_err = httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+    free(response);
+    return send_err;
 }
 
 static esp_err_t send_config_json(httpd_req_t *request)
 {
     device_config_snapshot_t config;
     esp_err_t err = device_config_get_snapshot(&config);
-    if (err != ESP_OK) {
-        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
-                                   "configuration unavailable");
+    if (err != ESP_OK) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "configuration unavailable");
+    char response[2048];
+    int length = snprintf(response, sizeof(response),
+        "{\"schema_version\":%" PRIu32 ",\"generation\":%" PRIu32 ",\"hostname\":\"%s\"," 
+        "\"cloudflare\":{\"configured\":%s,\"zone_name\":\"%s\",\"zone_id\":\"%s\",\"api_token_present\":%s},"
+        "\"peer_monitor\":{\"enabled\":%s,\"poll_interval_seconds\":%" PRIu32 ",\"response_timeout_ms\":%" PRIu32 ",\"peers\":[",
+        config.schema_version, config.generation, config.hostname,
+        config.cloudflare_configured ? "true" : "false",
+        config.cloudflare_configured ? config.cloudflare_zone_name : "",
+        config.cloudflare_configured ? config.cloudflare_zone_id : "",
+        config.cloudflare_configured ? "true" : "false",
+        config.ntp_peer_monitor_enabled ? "true" : "false",
+        config.ntp_peer_poll_interval_seconds, config.ntp_peer_response_timeout_ms);
+    for (size_t i = 0; i < APP_NTP_PEER_MAX_COUNT && length > 0 && length < (int)sizeof(response); ++i) {
+        int n = snprintf(response + length, sizeof(response) - (size_t)length,
+                         "%s{\"index\":%u,\"enabled\":%s,\"server\":\"%s\"}",
+                         i ? "," : "", (unsigned)i, config.ntp_peers[i].enabled ? "true" : "false",
+                         config.ntp_peers[i].server);
+        if (n < 0 || n >= (int)(sizeof(response) - (size_t)length)) { length = (int)sizeof(response); break; }
+        length += n;
     }
-    char response[768];
-    const int length = snprintf(response, sizeof(response),
-                                "{\"schema_version\":%" PRIu32
-                                ",\"generation\":%" PRIu32
-                                ",\"hostname\":\"%s\""
-                                ",\"cloudflare\":{\"configured\":%s,"
-                                "\"zone_name\":\"%s\",\"zone_id\":\"%s\","
-                                "\"api_token_present\":%s}}\n",
-                                config.schema_version, config.generation, config.hostname,
-                                config.cloudflare_configured ? "true" : "false",
-                                config.cloudflare_configured ? config.cloudflare_zone_name : "",
-                                config.cloudflare_configured ? config.cloudflare_zone_id : "",
-                                config.cloudflare_configured ? "true" : "false");
-    if (length < 0 || length >= (int)sizeof(response)) {
-        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
-                                   "configuration serialization failed");
+    if (length > 0 && length < (int)sizeof(response)) {
+        int n = snprintf(response + length, sizeof(response) - (size_t)length, "]}}\n");
+        if (n < 0 || n >= (int)(sizeof(response) - (size_t)length)) length = (int)sizeof(response); else length += n;
     }
-    httpd_resp_set_type(request, "application/json");
-    set_security_headers(request);
+    if (length < 0 || length >= (int)sizeof(response)) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "configuration serialization failed");
+    httpd_resp_set_type(request, "application/json"); set_security_headers(request);
     return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
 }
 
@@ -1920,6 +2015,143 @@ static bool parse_hostname_json(const char *body,
 
 static esp_err_t config_get_handler(httpd_req_t *request)
 {
+    return send_config_json(request);
+}
+
+static const char *json_value_after_key(const char *body, const char *key)
+{
+    static char pattern[64];
+
+    if (body == NULL || key == NULL || strlen(key) > 48U) {
+        return NULL;
+    }
+
+    (void)snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+
+    const char *p = strstr(body, pattern);
+    if (p == NULL) {
+        return NULL;
+    }
+
+    p += strlen(pattern);
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+        ++p;
+    }
+
+    if (*p != ':') {
+        return NULL;
+    }
+    ++p;
+
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+        ++p;
+    }
+
+    return p;
+}
+
+static bool json_get_bool(const char *body, const char *key, bool *out)
+{
+    if (out == NULL) {
+        return false;
+    }
+
+    const char *p = json_value_after_key(body, key);
+    if (p == NULL) {
+        return false;
+    }
+
+    if (strncmp(p, "true", 4U) == 0) {
+        *out = true;
+        return true;
+    }
+    if (strncmp(p, "false", 5U) == 0) {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
+static bool json_get_u32(const char *body, const char *key, uint32_t *out)
+{
+    if (out == NULL) {
+        return false;
+    }
+
+    const char *p = json_value_after_key(body, key);
+    if (p == NULL || *p < '0' || *p > '9') {
+        return false;
+    }
+
+    char *end = NULL;
+    const unsigned long v = strtoul(p, &end, 10);
+    if (end == p || v > UINT32_MAX) {
+        return false;
+    }
+
+    *out = (uint32_t)v;
+    return true;
+}
+
+static bool json_get_string(const char *body, const char *key, char *out, size_t out_size)
+{
+    if (out == NULL || out_size == 0U) {
+        return false;
+    }
+
+    const char *p = json_value_after_key(body, key);
+    if (p == NULL || *p != '"') {
+        return false;
+    }
+    ++p;
+
+    size_t n = 0U;
+    while (*p != '\0' && *p != '"') {
+        if (*p == '\\' || n + 1U >= out_size) {
+            return false;
+        }
+        out[n++] = *p++;
+    }
+
+    if (*p != '"') {
+        return false;
+    }
+
+    out[n] = '\0';
+    return true;
+}
+
+static esp_err_t peer_monitor_put_handler(httpd_req_t *request)
+{
+    if (request->content_len <= 0 || request->content_len >= APP_WEB_CONFIG_BODY_MAX)
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid request body");
+    char body[APP_WEB_CONFIG_BODY_MAX]; size_t received = 0U;
+    while (received < (size_t)request->content_len) {
+        const int r = httpd_req_recv(request, body + received, (size_t)request->content_len - received);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (r <= 0) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "request body receive failed");
+        received += (size_t)r;
+    }
+    body[received] = '\0';
+    bool enabled = false; uint32_t poll = 0U, timeout = 0U;
+    if (!json_get_bool(body, "enabled", &enabled) || !json_get_u32(body, "poll_interval_seconds", &poll) ||
+        !json_get_u32(body, "response_timeout_ms", &timeout))
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "enabled, poll_interval_seconds and response_timeout_ms are required");
+    if (poll < APP_NTP_PEER_POLL_MIN_SECONDS || poll > APP_NTP_PEER_POLL_MAX_SECONDS ||
+        timeout < APP_NTP_PEER_TIMEOUT_MIN_MS || timeout > APP_NTP_PEER_TIMEOUT_MAX_MS)
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "poll interval or timeout out of range");
+    device_config_ntp_peer_t peers[APP_NTP_PEER_MAX_COUNT]; memset(peers, 0, sizeof(peers));
+    for (size_t i = 0; i < APP_NTP_PEER_MAX_COUNT; ++i) {
+        char key_enabled[24], key_server[16]; snprintf(key_enabled, sizeof(key_enabled), "peer%u_enabled", (unsigned)i); snprintf(key_server, sizeof(key_server), "peer%u", (unsigned)i);
+        if (!json_get_bool(body, key_enabled, &peers[i].enabled) || !json_get_string(body, key_server, peers[i].server, sizeof(peers[i].server)))
+            return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "all peerN_enabled and peerN fields are required");
+        if (peers[i].enabled && !device_config_ntp_peer_server_is_valid(peers[i].server))
+            return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid enabled peer server");
+        if (!peers[i].enabled) peers[i].server[0] = '\0';
+    }
+    const esp_err_t err = device_config_set_ntp_peer_monitor(enabled, poll, timeout, peers);
+    if (err != ESP_OK) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "peer monitor configuration commit failed");
+    ESP_LOGI(TAG, "Peer monitor configuration updated: enabled=%d poll=%" PRIu32 " timeout=%" PRIu32 " ms", enabled, poll, timeout);
     return send_config_json(request);
 }
 
@@ -3223,10 +3455,10 @@ static esp_err_t index_handler(httpd_req_t *request)
         ".value{font-family:ui-monospace,Consolas,monospace;text-align:right;line-height:1.35;min-width:0;max-width:100%;overflow-wrap:anywhere;word-break:break-word;white-space:normal}.nowrap{white-space:nowrap;overflow-wrap:normal;word-break:normal;font-size:clamp(.72rem,.85vw,.92rem)}\n"
         ".actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}\n"
         "button{border:1px solid #3d6175;background:#203b4b;color:#e9f0f5;border-radius:7px;padding:10px 14px;font-weight:bold;cursor:pointer}\n"
-        "button:hover{background:#294d61}button.danger{border-color:#81434a;background:#4c2226}button:disabled{opacity:.55;cursor:not-allowed}\n"
-        ".actionmsg{margin-top:12px;color:#a8bac7;overflow-wrap:anywhere}\n"
+        "input{width:100%;background:#0d141b;color:#e9f0f5;border:1px solid #3d6175;border-radius:6px;padding:8px}label.check{display:flex;gap:8px;align-items:center}.peerform{display:grid;gap:8px;margin-top:10px}.peerline{display:grid;grid-template-columns:80px 1fr;gap:8px;align-items:center}button:hover{background:#294d61}button.danger{border-color:#81434a;background:#4c2226}button:disabled{opacity:.55;cursor:not-allowed}\n"
+        ".actionmsg{margin-top:12px;color:#a8bac7;overflow-wrap:anywhere}.peers{display:grid;gap:10px;margin-top:12px}.peerbox{border:1px solid #294252;border-radius:8px;padding:11px;background:#101b24}.peerhead{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:7px}.peername{font-weight:bold;color:#c9e8f8}.peerhealth{font-weight:bold;font-size:.78rem;padding:4px 8px;border-radius:999px}.peerhealth.healthy{background:#173f2b;color:#9bea75}.peerhealth.degraded,.peerhealth.divergent,.peerhealth.kod{background:#493b18;color:#ffd569}.peerhealth.unreachable,.peerhealth.invalid{background:#4c2226;color:#ff9292}.peerhealth.unknown{background:#223643;color:#a9d8ef}.peerstats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:14px}.peerstats .row{grid-template-columns:minmax(0,46%) minmax(0,54%);padding:6px 0;font-size:.84rem}.peernote{margin-top:8px;color:#8ca1ae;font-size:.78rem}\n"
         "footer{padding:22px 0 4px;color:#8ca1ae;font-size:.82rem}code{color:#9bea75;overflow-wrap:anywhere}\n"
-        "@media(max-width:1200px){.cardcolumns{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:700px){.cardcolumns{grid-template-columns:1fr}main{padding:12px}.row{grid-template-columns:1fr;gap:4px}.value{text-align:left}header{padding:18px}.headerline{align-items:flex-start;flex-direction:column}.headerstatus{justify-content:flex-start;margin-left:0}}\n"
+        "@media(max-width:1200px){.cardcolumns{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:700px){.cardcolumns{grid-template-columns:1fr}main{padding:12px}.row{grid-template-columns:1fr;gap:4px}.value{text-align:left}.peerstats{grid-template-columns:1fr}header{padding:18px}.headerline{align-items:flex-start;flex-direction:column}.headerstatus{justify-content:flex-start;margin-left:0}}\n"
         "</style></head><body>\n"
         "<header><div class=\"headerline\"><div class=\"headertitle\"><h1>ESP32-P4 GNSS NTP Server</h1>\n"
         "<p>mTLS-authenticated HTTPS operational console &middot; automatic refresh every three seconds</p></div>\n"
@@ -3235,6 +3467,7 @@ static esp_err_t index_handler(httpd_req_t *request)
         "</main>\n"
         "<script>\n"
         "function esc(v){return String(v==null||v===''?'--':v).replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));}\n"
+        "function attr(v){return String(v==null?'':v).replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));}\n"
         "function row(k,v){return '<div class=\"row\"><span class=\"key\">'+esc(k)+'</span><span class=\"value\">'+esc(v)+'</span></div>';}\n"
         "function rowNowrap(k,v){return '<div class=\"row\"><span class=\"key\">'+esc(k)+'</span><span class=\"value nowrap\">'+esc(v)+'</span></div>';}\n"
         "function card(t,r,extra=''){return '<section class=\"card\"><h2>'+esc(t)+'</h2>'+r.join('')+extra+'</section>';}\n"
@@ -3255,12 +3488,20 @@ static esp_err_t index_handler(httpd_req_t *request)
         "}\n"
         "function renew(){if(confirm('Request production certificate renewal now? The existing 30-day renewal policy is still enforced.'))action('/api/v1/acme/production/certificate/renew','renewbtn');}\n"
         "function reboot(){if(confirm('Reboot the NTP server now? NTP and management HTTPS will be temporarily unavailable.'))action('/api/v1/system/reboot','rebootbtn');}\n"
+        "let peerFormDirty=false;\n"
+        "function peerFieldTarget(e){const x=e.target;if(!x||!x.id)return false;return x.id==='pen'||x.id==='ppoll'||x.id==='ptimeout'||/^pe[0-3]$/.test(x.id)||/^ps[0-3]$/.test(x.id);}\n"
+        "document.addEventListener('focusin',e=>{if(!peerFieldTarget(e))return;const x=e.target;if(/^ps[0-3]$/.test(x.id)&&x.value.trim()==='--'){x.value='';peerFormDirty=true;}});\n"
+        "document.addEventListener('input',e=>{if(peerFieldTarget(e))peerFormDirty=true;});\n"
+        "document.addEventListener('change',e=>{if(peerFieldTarget(e))peerFormDirty=true;});\n"
+        "async function savePeers(){const m=document.getElementById('peermsg');try{const body={enabled:document.getElementById('pen').checked,poll_interval_seconds:Number(document.getElementById('ppoll').value),response_timeout_ms:Number(document.getElementById('ptimeout').value)};for(let i=0;i<4;i++){body['peer'+i+'_enabled']=document.getElementById('pe'+i).checked;const v=document.getElementById('ps'+i).value.trim();body['peer'+i]=(v==='--'?'':v);}const r=await fetch('/api/v1/config/peer-monitor',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const t=await r.text();m.textContent=(r.ok?'Saved: ':'Refused: ')+(t||('HTTP '+r.status));if(r.ok){peerFormDirty=false;setTimeout(refresh,300);}}catch(e){m.textContent='Request error: '+e.message;}}\n"
         "async function refresh(){\n"
+        " if(peerFormDirty)return;\n"
         " try{\n"
-        "  const [d,cert,sched]=await Promise.all([\n"
+        "  const [d,cert,sched,cfg]=await Promise.all([\n"
         "   getJson('/api/v1/status'),\n"
         "   getJson('/api/v1/acme/production/certificate'),\n"
-        "   getJson('/api/v1/acme/production/renewal/scheduler')\n"
+        "   getJson('/api/v1/acme/production/renewal/scheduler'),\n"
+        "   getJson('/api/v1/config')\n"
         "  ]);\n"
         "  const summary=[\n"
         "   badge('Clock: '+d.clock.state,stateClass(d.clock.state)),\n"
@@ -3278,11 +3519,11 @@ static esp_err_t index_handler(httpd_req_t *request)
         "   row('Phase Error',d.clock.phase_error_ns+' ns'),row('Frequency',d.clock.frequency_ppm+' ppm'),\n"
         "   row('Samples',d.clock.accepted_samples+' accepted / '+d.clock.rejected_samples+' rejected'),\n"
         "   row('Holdover',d.clock.holdover_seconds+' s')]));\n"
-        "  col2.push(card('PPS Capture',[\n"
+        "  col1.push(card('PPS Capture',[\n"
         "   row('Interval Valid',yesNo(d.pps.valid)),row('Period',d.pps.period_us+' us'),\n"
         "   row('Jitter',d.pps.jitter_us+' us'),row('Last Edge Age',d.pps.age_us+' us'),\n"
         "   row('Captured Edges',d.pps.edge_count),row('Queue Drops',d.pps.queue_drops)]));\n"
-        "  col3.push(card('GNSS Receiver',[\n"
+        "  col1.push(card('GNSS Receiver',[\n"
         "   row('Receiver Model',d.gnss.receiver_model),\n"
         "   row('Receiver SW',d.gnss.receiver_software_version),\n"
         "   row('Receiver HW',d.gnss.receiver_hardware_version),\n"
@@ -3309,7 +3550,7 @@ static esp_err_t index_handler(httpd_req_t *request)
         "   row('Activation Intent Pending',yesNo(sched.tls_activation_intent_pending)),\n"
         "   row('Handoff In Progress',yesNo(sched.tls_handoff_in_progress))\n"
         "  ]));\n"
-        "  col1.push(card('NTP Service',[\n"
+        "  col2.push(card('NTP Service',[\n"
         "   row('UDP Socket Bound',yesNo(d.ntp.socket_bound)),row('Advertised Stratum',d.ntp.advertised_stratum),\n"
         "   row('Leap Indicator',d.ntp.advertised_leap),row('Requests Received',d.ntp.requests),\n"
         "   row('Responses Sent',d.ntp.responses),row('Invalid Requests',d.ntp.invalid_requests),\n"
@@ -3320,14 +3561,16 @@ static esp_err_t index_handler(httpd_req_t *request)
         "   row('NTS-KE Failures',d.nts.ke_exchange_failures),row('TLS Handshake Failures',d.nts.ke_tls_handshake_failures),\n"
         "   row('ALPN Rejections',d.nts.ke_alpn_rejections),row('Verification Attempts',d.nts.verification_attempts),\n"
         "   row('Authenticated Requests',d.nts.authenticated_requests),row('Verification Failures',d.nts.verification_failures),\n"
-        "   row('Protected Responses',d.nts.protected_responses),row('Protection Failures',d.nts.protection_failures)]));\n"        "  col2.push(card('API Locations',[\n"
-        "   row('Status','/api/v1/status'),row('Health','/api/v1/health'),row('Metrics','/metrics'),\n"
-        "   row('Configuration','GET /api/v1/config'),row('Hostname','PUT /api/v1/config/hostname'),\n"
-        "   row('Cloudflare','PUT/DELETE /api/v1/config/cloudflare')]));\n"
+        "   row('Protected Responses',d.nts.protected_responses),row('Protection Failures',d.nts.protection_failures)]));\n"
         "  col3.push(card('Network',[\n"
         "   row('Hostname',d.device.hostname),row('IPv4 Address',d.device.ipv4),row('Netmask',d.device.netmask),\n"
         "   row('Gateway',d.device.gateway),row('Ethernet Link',yesNo(d.device.link_up)),row('Ethernet MAC',d.device.mac)]));\n"
-        "  col1.push(card('System Actions',[\n"
+        "  const pm=d.peer_monitor,pc=cfg.peer_monitor;let pr=[row('Running',yesNo(pm.running)),row('Enabled',yesNo(pm.enabled)),row('Poll Interval',pm.poll_interval_seconds+' s'),row('Response Timeout',pm.response_timeout_ms+' ms'),row('Poll Cycles',pm.poll_cycles),row('Healthy Peers',pm.healthy_peers+' / '+pm.configured_peers),row('Cross-Peer Spread',pm.cross_peer_spread_valid?pm.cross_peer_spread_ns+' ns':'--'),row('Best Observed Peer',pm.best_observed_peer_valid?'Peer '+(pm.best_observed_peer_index+1):'--')];let peerHtml='<div class=\"peers\">';for(const p of pm.peers){if(!p.configured)continue;const hc=String(p.health||'UNKNOWN').toLowerCase();peerHtml+='<div class=\"peerbox\"><div class=\"peerhead\"><span class=\"peername\">Peer '+(p.index+1)+'</span><span class=\"peerhealth '+attr(hc)+'\">'+esc(p.health)+'</span></div><div class=\"peerstats\">'+row('Server',p.server)+row('Offset',p.offset_ns+' ns')+row('Delay',p.delay_ns+' ns')+row('Jitter',p.jitter_ns+' ns')+row('Reachability','0x'+Number(p.reachability).toString(16).padStart(2,'0'))+row('Stratum',p.stratum)+row('Reference ID',p.reference_id)+row('Rolling Samples',p.rolling_samples)+row('Last Success',p.last_success_age_seconds+' s ago')+row('Polls',p.successful_polls+' ok / '+p.failed_polls+' failed')+row('Rejected',p.rejected_responses)+row('Duplicates',p.duplicate_responses)+'</div></div>';}peerHtml+='</div>';let form='<div class=\"peerform\"><label class=\"check\"><input id=\"pen\" type=\"checkbox\" '+(pc.enabled?'checked':'')+'> Enable peer monitoring</label><div class=\"peerline\"><span>Poll (s)</span><input id=\"ppoll\" type=\"number\" min=\"4\" max=\"3600\" value=\"'+pc.poll_interval_seconds+'\"></div><div class=\"peerline\"><span>Timeout</span><input id=\"ptimeout\" type=\"number\" min=\"250\" max=\"10000\" value=\"'+pc.response_timeout_ms+'\"></div>';for(let i=0;i<4;i++){const p=pc.peers[i];form+='<div class=\"peerline\"><label class=\"check\"><input id=\"pe'+i+'\" type=\"checkbox\" '+(p.enabled?'checked':'')+'> Peer '+(i+1)+'</label><input id=\"ps'+i+'\" value=\"'+attr(p.server||'')+'\" placeholder=\"server name or IPv4\"></div>';}form+='<div class=\"actions\"><button onclick=\"savePeers()\">Save Peer Configuration</button></div><div id=\"peermsg\" class=\"actionmsg\">Measurement only; never disciplines the local clock.</div></div>';col3.push(card('Peer Monitoring',pr,peerHtml+form));\n"
+        "  col2.push(card('API Locations',[\n"
+        "   row('Status','/api/v1/status'),row('Health','/api/v1/health'),row('Metrics','/metrics'),\n"
+        "   row('Configuration','GET /api/v1/config'),row('Hostname','PUT /api/v1/config/hostname'),\n"
+        "   row('Cloudflare','PUT/DELETE /api/v1/config/cloudflare'),row('Peer Monitor','PUT /api/v1/config/peer-monitor')]));\n"
+        "  col4.push(card('System Actions',[\n"
         "   row('Uptime',duration(d.system.uptime_seconds)),row('Last Reset',hst(d.system.boot_time_unix,d.system.boot_time_valid)),\n"
         "   row('Reset Reason',d.system.reset_reason),row('Management TLS',d.console.mode),row('Renewal Eligible Now',yesNo(sched.eligible))\n"
         "  ],'<div class=\"actions\"><button id=\"renewbtn\" onclick=\"renew()\">Renew Certificate</button><button id=\"rebootbtn\" class=\"danger\" onclick=\"reboot()\">Reboot Device</button></div><div id=\"actionmsg\" class=\"actionmsg\">Actions require this authenticated mTLS session.</div>'));\n"
@@ -3399,6 +3642,13 @@ static const httpd_uri_t s_config_get_uri = {
     .uri = "/api/v1/config",
     .method = HTTP_GET,
     .handler = config_get_handler,
+    .user_ctx = NULL,
+};
+
+static const httpd_uri_t s_peer_monitor_put_uri = {
+    .uri = "/api/v1/config/peer-monitor",
+    .method = HTTP_PUT,
+    .handler = peer_monitor_put_handler,
     .user_ctx = NULL,
 };
 
@@ -3571,7 +3821,7 @@ static esp_err_t register_all_handlers(httpd_handle_t server)
     const httpd_uri_t *handlers[] = {
         &s_index_uri, &s_status_uri, &s_health_uri, &s_metrics_uri,
         &s_system_reboot_uri,
-        &s_config_get_uri, &s_hostname_put_uri, &s_cloudflare_put_uri,
+        &s_config_get_uri, &s_peer_monitor_put_uri, &s_hostname_put_uri, &s_cloudflare_put_uri,
         &s_cloudflare_delete_uri, &s_cloudflare_verify_uri,
         &s_dns01_create_uri, &s_dns01_query_uri, &s_dns01_delete_uri,
         &s_acme_staging_probe_uri, &s_acme_account_status_uri,

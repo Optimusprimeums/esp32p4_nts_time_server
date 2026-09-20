@@ -816,5 +816,27 @@ bool ntp_server_get_status(ntp_server_status_t *out_status)
     *out_status = s_status;
     portEXIT_CRITICAL(&s_ntp_lock);
 
+    /*
+     * advertised_* describes what a normal NTP response would advertise now,
+     * not merely what the most recently transmitted response advertised.
+     * Keep the request/response counters historical, but derive service quality
+     * from the same read-only quality gate used by build_server_response().
+     * This has no timing or clock-discipline authority.
+     */
+    uint8_t stratum = NTP_STRATUM_UNSYNCED;
+    uint8_t leap = NTP_LI_UNSYNCED;
+    uint32_t refid = 0U;
+    uint32_t dispersion = 0U;
+
+    if (get_server_quality(&stratum, &leap, &refid, &dispersion)) {
+        out_status->advertised_stratum = stratum;
+        out_status->advertised_leap_indicator = leap;
+        out_status->advertised_root_dispersion = dispersion;
+    } else {
+        out_status->advertised_stratum = NTP_STRATUM_UNSYNCED;
+        out_status->advertised_leap_indicator = NTP_LI_UNSYNCED;
+        out_status->advertised_root_dispersion = 0U;
+    }
+
     return true;
 }

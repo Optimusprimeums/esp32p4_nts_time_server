@@ -8,10 +8,10 @@ an authenticated HTTPS management plane.
 > **Current production baseline:** Phase 5B management/security and
 > certificate lifecycle are frozen. Phase 6 NTP hardware timestamping,
 > precision optimization, end-to-end validation, production stability,
-> and startup PTP/UTC correlation optimization are **VALIDATED / FROZEN**.
-> The HP-LP independent PPS health-supervision track is **PASS / FROZEN / CLOSED**.
-> **NTS-Intergration** is **PASS / CLOSED**, with the NTS subsystem
-> **VALIDATED / FROZEN**.
+> and startup PTP/UTC correlation optimization are **VALIDATED /
+> FROZEN**. The HP-LP independent PPS health-supervision track is **PASS
+> / FROZEN / CLOSED**. Phase 7 **NTS-Intergration** is **PASS /
+> CLOSED**, with the NTS subsystem **VALIDATED / FROZEN**.
 
 
 ## Platform
@@ -378,12 +378,14 @@ System Actions       API Locations
 ```
 
 The NTS Service card exposes NTS-KE state and exchange counters together
-with authenticated-request and protected-response counters. It also reports
-TLS handshake, ALPN, verification, and response-protection failures. The same
-NTS observability is available through `/api/v1/status` and `/metrics`.
+with authenticated-request and protected-response counters. It also
+reports TLS handshake, ALPN, verification, and response-protection
+failures. The same NTS observability is available through
+`/api/v1/status` and `/metrics`.
 
 The GNSS card includes receiver-reported UBX-MON-VER identity, software
-version, and hardware version. The certificate identity is displayed without wrapping.
+version, and hardware version. The certificate identity is displayed
+without wrapping.
 
 System Actions provides authenticated controls for:
 
@@ -498,17 +500,18 @@ NTP subsystem                            VALIDATED / FROZEN
 
 ## Phase 7 --- NTS-Intergration
 
-Phase 7 integrated Network Time Security around the frozen production NTP
-timing path. NTS adds authentication authority only; it does not own or alter
-GNSS/PPS discipline, authoritative hardware RX timestamping, late-L2 T3/XMT
-placement, or the frozen transmit compensation.
+Phase 7 integrated Network Time Security around the frozen production
+NTP timing path. NTS adds authentication authority only; it does not own
+or alter GNSS/PPS discipline, authoritative hardware RX timestamping,
+late-L2 T3/XMT placement, or the frozen transmit compensation.
 
 ### Phase 7A --- architecture and integration boundary
 
-The integration reused the existing Phase 5B production ACME certificate and
-private-key lifecycle for the NTS-KE TLS server identity. Management HTTPS on
-TCP/443 remains independently protected by mandatory client-certificate mTLS.
-No second TLS certificate authority or certificate store was introduced.
+The integration reused the existing Phase 5B production ACME certificate
+and private-key lifecycle for the NTS-KE TLS server identity. Management
+HTTPS on TCP/443 remains independently protected by mandatory
+client-certificate mTLS. No second TLS certificate authority or
+certificate store was introduced.
 
 ``` text
 NTS-KE TLS identity          existing production ACME certificate/key
@@ -525,10 +528,11 @@ TX compensation              98,941 ns / FROZEN
 
 ### Phase 7B --- cryptographic and cookie foundation
 
-NTS cookie-key persistence uses the existing encrypted `nvs_certs` partition
-under a separate `nts` namespace. The NTS cookie implementation uses
-AES-SIV-CMAC-256 with authenticated cookie metadata and fail-closed validation.
-The production key ring maintains previous, active, and next key slots.
+NTS cookie-key persistence uses the existing encrypted `nvs_certs`
+partition under a separate `nts` namespace. The NTS cookie
+implementation uses AES-SIV-CMAC-256 with authenticated cookie metadata
+and fail-closed validation. The production key ring maintains previous,
+active, and next key slots.
 
 ``` text
 nvs_certs
@@ -544,10 +548,10 @@ Cookie validation         key ID, format/version, issue/expiry, authentication
 
 ### Phase 7C --- NTS-KE server
 
-NTS-KE is served on TCP/4460 using TLS 1.3 and ALPN `ntske/1`. The server
-negotiates NTPv4 as the next protocol and AES-SIV-CMAC-256 as the AEAD, and
-issues eight initial cookies. The NTS-KE endpoint does not require the
-management-plane client certificate.
+NTS-KE is served on TCP/4460 using TLS 1.3 and ALPN `ntske/1`. The
+server negotiates NTPv4 as the next protocol and AES-SIV-CMAC-256 as the
+AEAD, and issues eight initial cookies. The NTS-KE endpoint does not
+require the management-plane client certificate.
 
 ``` text
 TCP port                     4460
@@ -563,11 +567,12 @@ Cookie size                  128 bytes
 
 ### Phase 7D --- NTS-protected NTP
 
-NTS extension-field processing wraps the existing UDP/123 NTP response path.
-Authenticated requests are verified with the cookie-derived C2S key. Responses
-echo the Unique Identifier, issue fresh cookies, and are authenticated with the
-S2C key. The existing authoritative mapped hardware RX timestamp remains T2,
-and the existing late-L2 path remains responsible for T3/XMT.
+NTS extension-field processing wraps the existing UDP/123 NTP response
+path. Authenticated requests are verified with the cookie-derived C2S
+key. Responses echo the Unique Identifier, issue fresh cookies, and are
+authenticated with the S2C key. The existing authoritative mapped
+hardware RX timestamp remains T2, and the existing late-L2 path remains
+responsible for T3/XMT.
 
 ``` text
 NTS request
@@ -580,17 +585,17 @@ NTS request
   -> MAC/DMA
 ```
 
-Invalid NTS authentication fails closed without producing an authenticated
-response. Conventional non-NTS NTP service remains supported and was
-regression-tested.
+Invalid NTS authentication fails closed without producing an
+authenticated response. Conventional non-NTS NTP service remains
+supported and was regression-tested.
 
 **Phase 7D: PASS / FROZEN.**
 
 ### Phase 7E --- key lifecycle and persistence
 
-The previous/active/next cookie-key lifecycle, promotion, persistence across
-reboot, and missing/corrupt-state handling were validated. Production test
-seams were removed after validation.
+The previous/active/next cookie-key lifecycle, promotion, persistence
+across reboot, and missing/corrupt-state handling were validated.
+Production test seams were removed after validation.
 
 **Phase 7E: PASS / FROZEN.**
 
@@ -602,16 +607,17 @@ Interoperability was validated with chrony 4.5 using:
 server <configured-server> nts iburst minpoll 2 maxpoll 4
 ```
 
-Six consecutive validation trials acquired the NTS source in approximately
-3-4 seconds. A final post-dashboard regression selected
+Six consecutive validation trials acquired the NTS source in
+approximately 3-4 seconds. A final post-dashboard regression selected
 `the configured NTS source` in approximately 3 seconds.
 
-Final live observability confirmed one completed NTS-KE exchange followed by
-nine authenticated NTS requests and nine protected responses, with zero NTS-KE
-exchange failures, zero ALPN rejections, zero verification failures, and zero
-response-protection failures. Two TLS handshake failures recorded during the
-final test session were caused by deliberate raw TCP reachability probes that
-opened TCP/4460 without performing TLS.
+Final live observability confirmed one completed NTS-KE exchange
+followed by nine authenticated NTS requests and nine protected
+responses, with zero NTS-KE exchange failures, zero ALPN rejections,
+zero verification failures, and zero response-protection failures. Two
+TLS handshake failures recorded during the final test session were
+caused by deliberate raw TCP reachability probes that opened TCP/4460
+without performing TLS.
 
 ``` text
 NTS-KE Running              YES
@@ -626,8 +632,8 @@ Protected Responses           9
 Protection Failures           0
 ```
 
-The NTP production path remained synchronized and fail-closed protections
-remained intact during NTS validation.
+The NTP production path remained synchronized and fail-closed
+protections remained intact during NTS validation.
 
 **Phase 7F: PASS / FROZEN.**
 
@@ -758,9 +764,12 @@ Exact log ordering can vary because services run concurrently.
     -   last-known-good TLS protections are applied.
     -   the permitted TLS source is selected.
 4.  **HP-LP PPS health supervision**
-    -   LP firmware starts as an independent passive PPS health observer.
-    -   GPIO 4 is the LP observer input; GPIO 5 remains the authoritative HP PPS input.
-    -   LP supervision has no GNSS, clock-discipline, Ethernet, or NTP authority.
+    -   LP firmware starts as an independent passive PPS health
+        observer.
+    -   GPIO 4 is the LP observer input; GPIO 5 remains the
+        authoritative HP PPS input.
+    -   LP supervision has no GNSS, clock-discipline, Ethernet, or NTP
+        authority.
 5.  **PPS capture**
     -   GPTimer and ETM PPS capture initialize.
     -   GPIO 5 rising-edge timing becomes available to the discipline
@@ -798,9 +807,12 @@ Exact log ordering can vary because services run concurrently.
     -   unserviceable states fail closed.
 10. **NTS-KE and NTS-protected NTP**
     -   NTS-KE starts on TCP/4460 using TLS 1.3 and ALPN `ntske/1`.
-    -   the existing production ACME certificate/key supplies the NTS-KE TLS identity.
-    -   NTS cookies and cookie-key state are restored from protected storage.
-    -   authenticated NTS requests wrap the frozen UDP/123 timing path without taking timing authority.
+    -   the existing production ACME certificate/key supplies the NTS-KE
+        TLS identity.
+    -   NTS cookies and cookie-key state are restored from protected
+        storage.
+    -   authenticated NTS requests wrap the frozen UDP/123 timing path
+        without taking timing authority.
 11. **HTTPS management**
     -   HTTPS starts on TCP/443.
     -   selected server certificate/key are loaded.
@@ -820,7 +832,8 @@ Exact log ordering can vary because services run concurrently.
     -   PTP/UTC correlation remains maintained at its 10-second
         steady-state cadence.
     -   NTP clients receive validated service.
-    -   NTS clients can acquire authenticated time through NTS-KE plus protected NTP.
+    -   NTS clients can acquire authenticated time through NTS-KE plus
+        protected NTP.
     -   management remains protected by mTLS.
 
 Expected healthy timing/NTP state:
@@ -877,8 +890,9 @@ cadence.
 
 ## HP-LP independent PPS health supervision
 
-The HP-LP track is complete and frozen. The LP core is an independent passive
-observer of GNSS PPS health and has no production timing authority.
+The HP-LP track is complete and frozen. The LP core is an independent
+passive observer of GNSS PPS health and has no production timing
+authority.
 
 ``` text
 GPIO 5 -> HP authoritative PPS via GPIO ISR + GPIO ETM -> GPTimer
@@ -891,11 +905,12 @@ LP autonomous loss watchdog      2.5 PPS periods
 LP loss/recovery counters        ENABLED
 ```
 
-Final fault-injection validation disconnected GPIO 4 while GPIO 5 remained
-authoritative. The LP observer transitioned HEALTHY -> LOST and recorded one
-loss while production timing remained synchronized with valid NTP responses and
-zero drops. Reconnecting GPIO 4 produced LOST -> HEALTHY with one recovery and
-no duplicate events. Final production NTP regression passed.
+Final fault-injection validation disconnected GPIO 4 while GPIO 5
+remained authoritative. The LP observer transitioned HEALTHY -\> LOST
+and recorded one loss while production timing remained synchronized with
+valid NTP responses and zero drops. Reconnecting GPIO 4 produced LOST
+-\> HEALTHY with one recovery and no duplicate events. Final production
+NTP regression passed.
 
 ``` text
 HP-LP.1-7   Core LP proof                         PASS / FROZEN
@@ -929,18 +944,197 @@ No further LP timing work is planned for the frozen baseline.
     on the very low deployment request rate and heavier completed
     validation; reopen only if deployment load or architecture changes
     materially.
--   LP PPS supervision remains strictly non-authoritative; future LP changes
-    must preserve GPIO 5 HP timing authority and the validated GPIO 4 observer path.
--   NTS cookie-key persistence and NTS-KE certificate reuse must remain aligned
-    with the protected-storage and ACME lifecycle when those subsystems change.
+-   LP PPS supervision remains strictly non-authoritative; future LP
+    changes must preserve GPIO 5 HP timing authority and the validated
+    GPIO 4 observer path.
+-   NTS cookie-key persistence and NTS-KE certificate reuse must remain
+    aligned with the protected-storage and ACME lifecycle when those
+    subsystems change.
 -   Secure Boot is intentionally not part of this project's security
     model.
 
+## Phase 8 --- Peer Health Monitoring
+
+Phase 8 adds read-only NTP peer observation around the frozen
+GNSS/PPS-disciplined clock. Peer measurements are telemetry only and
+have no timing authority.
+
+``` text
+GNSS / PPS -> disciplined UTC -> Peer Monitor (READ ONLY)
+                                      |
+                                      X
+                               NO WRITE-BACK
+```
+
+The peer monitor supports up to four configured peers using IPv4
+addresses or DNS names. It performs NTPv4 client polling and records
+T1/T2/T3/T4-derived offset and delay, reachability, jitter, rolling
+statistics, stratum, leap indicator, reference ID, root delay, root
+dispersion, success/failure counts, last-success age, and
+protocol-validation counters.
+
+Per-peer health states are:
+
+``` text
+UNKNOWN
+HEALTHY
+DEGRADED
+UNREACHABLE
+DIVERGENT
+KOD
+INVALID
+DISABLED
+```
+
+Cross-peer telemetry includes observed offset spread, divergence
+detection, and a best-observed-peer indicator. The best-observed
+calculation is telemetry only and cannot select or discipline the
+production clock.
+
+### Phase 8A --- architecture and peer-monitor engine
+
+The implementation preserves the one-way timing-authority boundary. T1
+and T4 are read from the existing disciplined clock, but peer
+observations are never submitted to clock discipline.
+
+Response validation covers source/length, leap indicator, NTP version
+and mode, stratum, originate timestamp, nonzero receive/transmit
+timestamps, KoD, duplicate/stale transmit timestamps, negative delay,
+malformed responses, and timeouts.
+
+Rolling statistics use integer arithmetic. Floating-point `long double`,
+`llroundl()`, and `sqrtl()` were removed from the peer-monitor task
+after runtime fault isolation.
+
+**Status: PASS / FROZEN**
+
+### Phase 8B --- configuration and observability
+
+Peer configuration supports up to four peers with persisted enable
+state, server, poll interval, and response timeout. The validated limits
+are:
+
+``` text
+maximum peers          4
+poll interval minimum  4 seconds
+poll interval maximum  3600 seconds
+default poll interval  16 seconds
+timeout minimum        250 ms
+timeout maximum        10000 ms
+default timeout        2000 ms
+rolling window         16 samples
+```
+
+Peer-monitor state is exposed through the authenticated management
+dashboard, `/api/v1/status`, and `/metrics`. Configuration changes reset
+the affected slot's runtime statistics.
+
+The management dashboard includes peer health, reachability, offset,
+delay, jitter, stratum, reference ID, rolling sample count, last-success
+age, poll counts, rejected responses, duplicate responses, cross-peer
+spread, and the best-observed peer.
+
+The final management layout is:
+
+``` text
+Column 1: Clock and Time -> PPS Capture -> GNSS Receiver
+Column 2: NTP Service -> NTS Service -> API Locations
+Column 3: Network -> Peer Monitoring
+Column 4: Certificate & ACME -> System Actions
+```
+
+The status-only advertised-stratum reporting path reads the existing
+server quality without mutating production timing state.
+
+**Status: PASS / FROZEN**
+
+### Phase 8C --- validation and production regression
+
+Validation exercised normal and adverse peer behavior while observing
+the production timing, NTP, NTS, and management paths.
+
+``` text
+8C.1  Peer response / packet validation       PASS / FROZEN
+8C.2  Unreachable peer + recovery             PASS / FROZEN
+8C.3  KoD / invalid / malformed handling      PASS / FROZEN
+8C.4  Multi-peer disagreement / divergence    PASS / FROZEN
+8C.5  Extended peer-monitor soak              PASS / FROZEN
+8C.6  Production NTP regression               PASS / FROZEN
+8C.7  Production NTS regression               PASS / FROZEN
+8C.8  Timing-authority isolation proof        PASS / FROZEN
+8C.9  Phase 8 closeout / freeze               PASS / CLOSED
+```
+
+Deterministic response testing covered valid replies, KoD, bad originate
+timestamps, short/malformed packets, duplicate transmit timestamps, and
+clean recovery. Additional testing proved unreachable-peer isolation and
+multi-peer divergence reporting.
+
+Peer polling is deliberately serialized. At most one peer-monitor UDP
+socket is active at a time. This prevents an unreachable peer from
+holding multiple peer sockets concurrently and preserves production
+service availability under resource pressure.
+
+The extended production soak exceeded 60 minutes and 225 peer-monitor
+cycles. The three normal production peers accumulated 906 successful
+polls with zero failures during the targeted soak. No reboot, stack
+fault, or timing-authority disturbance occurred.
+
+The final conventional-NTP regression completed 100 requests at a
+5-second cadence with valid synchronized Stratum-1 responses.
+
+The final NTS regression completed NTS-KE with TLS 1.3, ALPN `ntske/1`,
+AEAD 15, and eight initial cookies, followed by 100 authenticated NTS
+requests and 100 protected responses with zero verification or
+protection failures.
+
+Timing-authority isolation was demonstrated while peer states included
+HEALTHY, DEGRADED, DIVERGENT, UNREACHABLE, KOD, INVALID, malformed,
+duplicate, timeout, and recovery conditions. The GNSS/PPS-disciplined
+clock remained authoritative and synchronized. Peer-monitor observations
+never write back into clock discipline.
+
+### Phase 8 frozen runtime invariants
+
+``` text
+NTP peer task stack       12288 bytes
+HTTPS management stack   12288 bytes
+ACME renewal task stack   12288 bytes
+Peer polling              sequential
+Maximum active peer UDP sockets during polling  1
+Peer timing authority     NONE
+```
+
+Do not reduce these task stacks without a new fault-driven validation
+gate. Do not restore concurrent peer polling without an explicit
+resource and production-regression gate.
+
+Phase 8 does not change any Phase 6 or Phase 7 timing/security
+authority:
+
+-   GNSS/PPS remains the only production clock-discipline authority.
+-   GPIO 5 HP PPS remains authoritative; GPIO 4 LP remains
+    observational.
+-   Ethernet hardware RX timestamp authority remains fail-closed.
+-   Late-L2 T3/XMT placement remains frozen.
+-   `ETH_NTP_TX_COMPENSATION_NS = 98941ULL` remains frozen.
+-   Peer measurements cannot alter clock discipline, stratum, leap
+    state, PTP/UTC mapping, NTP timestamps, NTS authentication, or
+    NTS-KE.
+-   NTS remains an authentication wrapper around the frozen NTP timing
+    path.
+-   Management mTLS remains mandatory.
+
+**Phase 8 Peer Health Monitoring: PASS / CLOSED**
+
+**Peer-monitor subsystem: VALIDATED / FROZEN**
+
 ## Future additions
 
-Phase 5B, Phase 6, HP-LP supervision, and Phase 7 NTS-Intergration are frozen.
-Future work must be introduced through explicit new gates rather than silently
-changing the validated baseline.
+Phase 5B, Phase 6, HP-LP supervision, Phase 7 NTS-Intergration, and
+Phase 8 Peer Health Monitoring are frozen. Future work must be
+introduced through explicit new gates rather than silently changing the
+validated baseline.
 
 1.  **Symmetric peer health monitoring --- observe only**
     -   configure one or more peer NTP servers
@@ -948,28 +1142,33 @@ changing the validated baseline.
     -   expose peer state through HTTPS/API/metrics
     -   do not discipline the GNSS clock or alter stratum automatically
 2.  **ACME/DNS hardening**
-    -   extend bounded `badNonce` handling to the initial new-account JWK path
+    -   extend bounded `badNonce` handling to the initial new-account
+        JWK path
     -   consider authoritative DNS propagation verification
     -   add lifecycle diagnostics only where they do not expose secrets
 3.  **Management-plane hardening and operations**
     -   review CSRF protections for mutable browser endpoints
-    -   expand audit/event history for configuration and certificate operations
-    -   consider role separation if multiple management identities are introduced
+    -   expand audit/event history for configuration and certificate
+        operations
+    -   consider role separation if multiple management identities are
+        introduced
 4.  **OTA lifecycle**
-    -   design authenticated OTA around the existing `ota_0`/`ota_1` partition layout
-    -   define rollback and image-integrity policy compatible with flash encryption
-        and the deliberate decision not to use Secure Boot
+    -   design authenticated OTA around the existing `ota_0`/`ota_1`
+        partition layout
+    -   define rollback and image-integrity policy compatible with flash
+        encryption and the deliberate decision not to use Secure Boot
     -   do not introduce OTA as an incidental management endpoint
 5.  **SDK/toolchain maintenance**
     -   re-evaluate the local NVS workaround on SDK upgrade
     -   reconcile Ethernet/DMA timestamp changes with upstream ESP-IDF
-    -   rerun Phase 6 hardware timestamp and TX compensation validation after
-        material SDK/toolchain changes
-    -   rerun NTS interoperability and protected-storage regression after material
-        TLS/crypto/storage changes
+    -   rerun Phase 6 hardware timestamp and TX compensation validation
+        after material SDK/toolchain changes
+    -   rerun NTS interoperability and protected-storage regression
+        after material TLS/crypto/storage changes
 6.  **Internal cleanup**
     -   rename the TIM-TP qErr status field to reflect picoseconds
-    -   remove obsolete compatibility/development code only after regression testing
+    -   remove obsolete compatibility/development code only after
+        regression testing
     -   preserve clean production copies of low-level Ethernet changes
 
 ## Engineering invariants
@@ -999,10 +1198,21 @@ When extending the project:
     server certificate
 -   do not weaken mTLS to hide expected rejected/speculative browser
     connections
--   preserve HP PPS/GNSS/clock/Ethernet/NTP authority; LP PPS supervision remains non-authoritative
--   preserve NTS-KE use of the existing production ACME certificate/key lifecycle
--   preserve separation between management mTLS authentication and NTS-KE TLS
--   preserve NTS authentication as a wrapper around, not a replacement for, the frozen NTP timing path
+-   preserve HP PPS/GNSS/clock/Ethernet/NTP authority; LP PPS
+    supervision remains non-authoritative
+-   preserve NTS-KE use of the existing production ACME certificate/key
+    lifecycle
+-   preserve separation between management mTLS authentication and
+    NTS-KE TLS
+-   preserve NTS authentication as a wrapper around, not a replacement
+    for, the frozen NTP timing path
+-   preserve peer monitoring as telemetry only with no clock-discipline
+    write-back
+-   preserve sequential peer polling with at most one peer-monitor UDP
+    socket active at a time
+-   preserve `NTP_PEER_TASK_STACK_SIZE = 12288U`
+-   preserve `APP_WEB_CONSOLE_STACK_SIZE = 12288U`
+-   preserve `APP_ACME_RENEWAL_TASK_STACK_SIZE = 12288U`
 -   use complete source replacements for controlled source changes
 -   do not claim a change is compiled or runtime-tested until it
     actually has been validated
@@ -1033,4 +1243,11 @@ Phase 7E key lifecycle / persistence        PASS / FROZEN
 Phase 7F interoperability / regression      PASS / FROZEN
 Phase 7 NTS-Intergration                    PASS / CLOSED
 NTS subsystem                               VALIDATED / FROZEN
+
+
+Phase 8A architecture / peer-monitor engine PASS / FROZEN
+Phase 8B config / observability             PASS / FROZEN
+Phase 8C validation / production regression PASS / FROZEN
+Phase 8 Peer Health Monitoring              PASS / CLOSED
+Peer-monitor subsystem                      VALIDATED / FROZEN
 ```
