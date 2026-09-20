@@ -17,3 +17,7 @@
 *.p12
 *.pfx
 
+serial_output1.log
+.gitignore
+serial_output2.log
+serial_output.log

@@ -27,6 +27,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -1394,6 +1395,29 @@ static void set_security_headers(httpd_req_t *request)
     httpd_resp_set_hdr(request, "Referrer-Policy", "no-referrer");
 }
 
+static const char *reset_reason_to_string(esp_reset_reason_t reason)
+{
+    switch (reason) {
+    case ESP_RST_POWERON:   return "POWER_ON";
+    case ESP_RST_EXT:       return "EXTERNAL";
+    case ESP_RST_SW:        return "SOFTWARE";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "INTERRUPT_WATCHDOG";
+    case ESP_RST_TASK_WDT:  return "TASK_WATCHDOG";
+    case ESP_RST_WDT:       return "OTHER_WATCHDOG";
+    case ESP_RST_DEEPSLEEP: return "DEEP_SLEEP";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_SDIO:      return "SDIO";
+    case ESP_RST_USB:       return "USB";
+    case ESP_RST_JTAG:      return "JTAG";
+    case ESP_RST_EFUSE:     return "EFUSE";
+    case ESP_RST_PWR_GLITCH:return "POWER_GLITCH";
+    case ESP_RST_CPU_LOCKUP:return "CPU_LOCKUP";
+    case ESP_RST_UNKNOWN:
+    default:                return "UNKNOWN";
+    }
+}
+
 static esp_err_t send_status_json(httpd_req_t *request)
 {
     app_state_snapshot_t app_status;
@@ -1435,6 +1459,15 @@ static esp_err_t send_status_json(httpd_req_t *request)
     const bool current_time_valid =
         get_current_unix_time(&unix_now);
 
+    const int64_t uptime_us = esp_timer_get_time();
+    const uint64_t uptime_seconds =
+        uptime_us > 0 ? (uint64_t)(uptime_us / 1000000LL) : 0ULL;
+    const bool boot_time_valid =
+        current_time_valid && unix_now >= (int64_t)uptime_seconds;
+    const int64_t boot_time_unix =
+        boot_time_valid ? unix_now - (int64_t)uptime_seconds : 0;
+    const char *reset_reason = reset_reason_to_string(esp_reset_reason());
+
     const bool ntp_ready =
         eth_status.ipv4_ready &&
         ntp_status.socket_bound &&
@@ -1450,6 +1483,12 @@ static esp_err_t send_status_json(httpd_req_t *request)
         "\"console\":{"
         "\"mode\":\"mtls_authenticated\","
         "\"port\":%u"
+        "},"
+        "\"system\":{"
+        "\"uptime_seconds\":%" PRIu64 ","
+        "\"boot_time_valid\":%s,"
+        "\"boot_time_unix\":%" PRId64 ","
+        "\"reset_reason\":\"%s\""
         "},"
         "\"readiness\":{"
         "\"ntp_ready\":%s,"
@@ -1534,6 +1573,10 @@ static esp_err_t send_status_json(httpd_req_t *request)
         "}"
         "}",
         APP_WEB_CONSOLE_PORT,
+        uptime_seconds,
+        boot_time_valid ? "true" : "false",
+        boot_time_unix,
+        reset_reason,
         ntp_ready ? "true" : "false",
         current_time_valid ? "true" : "false",
         unix_now,
@@ -3198,6 +3241,8 @@ static esp_err_t index_handler(httpd_req_t *request)
         "function badge(t,c){return '<span class=\"badge '+c+'\">'+esc(t)+'</span>';}\n"
         "function yesNo(v){return v?'YES':'NO';}\n"
         "function utc(v,valid=true){if(!valid||!v)return '--';try{return new Date(Number(v)*1000).toISOString();}catch(e){return '--';}}\n"
+        "function hst(v,valid=true){if(!valid||!v)return '--';try{const d=new Date((Number(v)-36000)*1000);const p=n=>String(n).padStart(2,'0');return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes())+':'+p(d.getUTCSeconds())+' HST';}catch(e){return '--';}}\n"
+        "function duration(v){v=Math.max(0,Math.floor(Number(v)||0));const d=Math.floor(v/86400);v%=86400;const h=Math.floor(v/3600);v%=3600;const m=Math.floor(v/60);const sec=v%60;return (d?d+'d ':'')+String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0');}\n"
         "function stateClass(s){if(s==='SYNCHRONIZED'||s==='valid')return'ok';if(s==='HOLDOVER'||s==='ACQUIRING'||s==='renewal_due'||s==='urgent')return'warn';return'bad';}\n"
         "async function getJson(url){const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error(url+' HTTP '+r.status);return r.json();}\n"
         "async function action(url,label){\n"
@@ -3283,7 +3328,8 @@ static esp_err_t index_handler(httpd_req_t *request)
         "   row('Hostname',d.device.hostname),row('IPv4 Address',d.device.ipv4),row('Netmask',d.device.netmask),\n"
         "   row('Gateway',d.device.gateway),row('Ethernet Link',yesNo(d.device.link_up)),row('Ethernet MAC',d.device.mac)]));\n"
         "  col1.push(card('System Actions',[\n"
-        "   row('Management TLS',d.console.mode),row('Renewal Eligible Now',yesNo(sched.eligible))\n"
+        "   row('Uptime',duration(d.system.uptime_seconds)),row('Last Reset',hst(d.system.boot_time_unix,d.system.boot_time_valid)),\n"
+        "   row('Reset Reason',d.system.reset_reason),row('Management TLS',d.console.mode),row('Renewal Eligible Now',yesNo(sched.eligible))\n"
         "  ],'<div class=\"actions\"><button id=\"renewbtn\" onclick=\"renew()\">Renew Certificate</button><button id=\"rebootbtn\" class=\"danger\" onclick=\"reboot()\">Reboot Device</button></div><div id=\"actionmsg\" class=\"actionmsg\">Actions require this authenticated mTLS session.</div>'));\n"
         "  document.getElementById('cards').innerHTML='<div class=\"cardcolumns\"><div class=\"cardcol\">'+col1.join('')+'</div><div class=\"cardcol\">'+col2.join('')+'</div><div class=\"cardcol\">'+col3.join('')+'</div><div class=\"cardcol\">'+col4.join('')+'</div></div>';\n"
         " }catch(e){\n"
