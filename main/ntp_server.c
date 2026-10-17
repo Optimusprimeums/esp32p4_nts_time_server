@@ -315,7 +315,7 @@ static bool get_server_quality(uint8_t *out_stratum,
 
         *out_stratum = NTP_STRATUM_PRIMARY;
         *out_leap = leap;
-        *out_refid = ntp_packet_refid_from_text("GPS ");
+        *out_refid = ntp_packet_refid_from_text("PPS ");
         *out_dispersion = clock_status.root_dispersion_16_16;
 
         return true;
