@@ -16,6 +16,9 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_system.h"
+#include "esp_ota_ops.h"
+#include "nvs.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
@@ -1222,6 +1225,66 @@ static void gnss_update_staleness(void)
 /* Ten minutes from GNSS task start, with all scheduled retries attempted. */
 #define GNSS_RECOVERY_REBOOT_AFTER_US (10LL * 60LL * 1000000LL)
 #define GNSS_RECOVERY_MIN_RETRIES 9U
+#define GNSS_RECOVERY_MAX_RESTARTS 2U
+
+/*
+ * Phase 9 OTA implementation must override this guard to report an active
+ * upload, validation or activation transaction. Fail closed until wired.
+ */
+__attribute__((weak)) bool gnss_recovery_ota_busy(void)
+{
+    return true;
+}
+
+static bool gnss_recovery_ota_safe(void)
+{
+    if (gnss_recovery_ota_busy()) {
+        return false;
+    }
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state;
+    if (running == NULL ||
+        esp_ota_get_state_partition(running, &state) != ESP_OK) {
+        return false;
+    }
+    return state == ESP_OTA_IMG_VALID || state == ESP_OTA_IMG_UNDEFINED;
+}
+
+static bool gnss_recovery_consume_restart_budget(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open("gnss_recovery", NVS_READWRITE, &handle) != ESP_OK) {
+        return false;
+    }
+    uint8_t count = 0U;
+    esp_err_t err = nvs_get_u8(handle, "reboots", &count);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(handle);
+        return false;
+    }
+    if (count >= GNSS_RECOVERY_MAX_RESTARTS) {
+        nvs_close(handle);
+        return false;
+    }
+    err = nvs_set_u8(handle, "reboots", (uint8_t)(count + 1U));
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err == ESP_OK;
+}
+
+static void gnss_recovery_clear_restart_budget(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open("gnss_recovery", NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+    if (nvs_set_u8(handle, "reboots", 0U) == ESP_OK) {
+        (void)nvs_commit(handle);
+    }
+    nvs_close(handle);
+}
 
 static void gnss_task(void *arg)
 {
@@ -1234,6 +1297,7 @@ static void gnss_task(void *arg)
         recovery_start_us + GNSS_RECOVERY_RETRY_INTERVAL_US;
     uint32_t recovery_attempts = 0U;
     bool recovery_exhausted_reported = false;
+    bool recovery_budget_cleared = false;
 
     while (true) {
         const int64_t now_us = esp_timer_get_time();
@@ -1241,6 +1305,11 @@ static void gnss_task(void *arg)
         portENTER_CRITICAL(&s_gnss_lock);
         receiver_identified = s_status.receiver_identity_valid;
         portEXIT_CRITICAL(&s_gnss_lock);
+
+        if (receiver_identified && !recovery_budget_cleared) {
+            gnss_recovery_clear_restart_budget();
+            recovery_budget_cleared = true;
+        }
 
         if (!receiver_identified && now_us >= next_recovery_probe_us) {
             ESP_LOGW(TAG, "GNSS receiver absent; retrying UBX initialization");
@@ -1255,20 +1324,31 @@ static void gnss_task(void *arg)
         }
 
         /*
-         * Deliberately do not reboot here yet: the active OTA upload and
-         * activation state is not exposed to this GNSS module in this
-         * baseline. The final recovery reboot must be gated by OTA state
-         * and a persistent restart budget to prevent reboot loops.
+         * Exhaustion is based on monotonic elapsed time AND completed retry
+         * attempts, not loss of satellite fix or PPS alone.
          */
         if (!receiver_identified && !recovery_exhausted_reported &&
             recovery_attempts >= GNSS_RECOVERY_MIN_RETRIES &&
             esp_timer_get_time() - recovery_start_us >=
                 GNSS_RECOVERY_REBOOT_AFTER_US) {
-            ESP_LOGE(TAG,
-                     "GNSS recovery exhausted after 10 minutes and %"
-                     PRIu32 " retries; reboot deferred until OTA-safe "
-                     "restart budget integration", recovery_attempts);
-            recovery_exhausted_reported = true;
+            if (!gnss_recovery_ota_safe()) {
+                /* OTA gate unavailable/busy: retry the decision later. */
+                ESP_LOGW(TAG, "GNSS restart deferred by OTA safety gate");
+                vTaskDelay(pdMS_TO_TICKS(1000U));
+            } else {
+                recovery_exhausted_reported = true;
+                if (gnss_recovery_consume_restart_budget()) {
+                    ESP_LOGE(TAG,
+                             "GNSS receiver absent after 10 minutes; "
+                             "automatic recovery reboot (%" PRIu32
+                             " retries)", recovery_attempts);
+                    esp_restart();
+                } else {
+                    ESP_LOGE(TAG,
+                             "GNSS recovery reboot budget exhausted or "
+                             "NVS unavailable; remaining online");
+                }
+            }
         }
 
         const int received = uart_read_bytes(uart_num,
