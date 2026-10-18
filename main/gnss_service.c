@@ -1213,14 +1213,43 @@ static void gnss_update_staleness(void)
     }
 }
 
+/*
+ * Hot-connected receivers may miss the one-shot boot configuration. Retry
+ * from the GNSS task itself so the UART parser has only one owner. PPS
+ * presence alone is not evidence of a working UBX communication channel.
+ */
+#define GNSS_RECOVERY_RETRY_INTERVAL_US (60LL * 1000000LL)
+
 static void gnss_task(void *arg)
 {
     (void)arg;
 
     uint8_t receive_buffer[GNSS_READ_BUFFER_SIZE];
     const uart_port_t uart_num = (uart_port_t)APP_GNSS_UART_NUM;
+    int64_t next_recovery_probe_us =
+        esp_timer_get_time() + GNSS_RECOVERY_RETRY_INTERVAL_US;
 
     while (true) {
+        const int64_t now_us = esp_timer_get_time();
+        bool receiver_identified;
+        uint32_t valid_frames;
+        portENTER_CRITICAL(&s_gnss_lock);
+        receiver_identified = s_status.receiver_identity_valid;
+        valid_frames = s_status.ubx_frames_valid;
+        portEXIT_CRITICAL(&s_gnss_lock);
+
+        if (!receiver_identified && valid_frames == 0U &&
+            now_us >= next_recovery_probe_us) {
+            ESP_LOGW(TAG, "GNSS receiver absent; retrying UBX initialization");
+            /* All command ACKs and UART input are processed by this task. */
+            if (APP_GNSS_CONFIGURE_UBX_ON_BOOT) {
+                gnss_configure_receiver();
+            }
+            ubx_poll_mon_ver();
+            next_recovery_probe_us =
+                esp_timer_get_time() + GNSS_RECOVERY_RETRY_INTERVAL_US;
+        }
+
         const int received = uart_read_bytes(uart_num,
                                              receive_buffer,
                                              sizeof(receive_buffer),
