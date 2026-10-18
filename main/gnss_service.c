@@ -1232,14 +1232,11 @@ static void gnss_task(void *arg)
     while (true) {
         const int64_t now_us = esp_timer_get_time();
         bool receiver_identified;
-        uint32_t valid_frames;
-        portENTER_CRITICAL(&s_gnss_lock);
+         portENTER_CRITICAL(&s_gnss_lock);
         receiver_identified = s_status.receiver_identity_valid;
-        valid_frames = s_status.ubx_frames_valid;
         portEXIT_CRITICAL(&s_gnss_lock);
 
-        if (!receiver_identified && valid_frames == 0U &&
-            now_us >= next_recovery_probe_us) {
+        if (!receiver_identified && now_us >= next_recovery_probe_us) {
             ESP_LOGW(TAG, "GNSS receiver absent; retrying UBX initialization");
             /* All command ACKs and UART input are processed by this task. */
             if (APP_GNSS_CONFIGURE_UBX_ON_BOOT) {
