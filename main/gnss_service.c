@@ -1219,6 +1219,9 @@ static void gnss_update_staleness(void)
  * presence alone is not evidence of a working UBX communication channel.
  */
 #define GNSS_RECOVERY_RETRY_INTERVAL_US (60LL * 1000000LL)
+/* Ten minutes from GNSS task start, with all scheduled retries attempted. */
+#define GNSS_RECOVERY_REBOOT_AFTER_US (10LL * 60LL * 1000000LL)
+#define GNSS_RECOVERY_MIN_RETRIES 9U
 
 static void gnss_task(void *arg)
 {
@@ -1226,13 +1229,16 @@ static void gnss_task(void *arg)
 
     uint8_t receive_buffer[GNSS_READ_BUFFER_SIZE];
     const uart_port_t uart_num = (uart_port_t)APP_GNSS_UART_NUM;
+    const int64_t recovery_start_us = esp_timer_get_time();
     int64_t next_recovery_probe_us =
-        esp_timer_get_time() + GNSS_RECOVERY_RETRY_INTERVAL_US;
+        recovery_start_us + GNSS_RECOVERY_RETRY_INTERVAL_US;
+    uint32_t recovery_attempts = 0U;
+    bool recovery_exhausted_reported = false;
 
     while (true) {
         const int64_t now_us = esp_timer_get_time();
         bool receiver_identified;
-         portENTER_CRITICAL(&s_gnss_lock);
+        portENTER_CRITICAL(&s_gnss_lock);
         receiver_identified = s_status.receiver_identity_valid;
         portEXIT_CRITICAL(&s_gnss_lock);
 
@@ -1243,8 +1249,26 @@ static void gnss_task(void *arg)
                 gnss_configure_receiver();
             }
             ubx_poll_mon_ver();
+            recovery_attempts++;
             next_recovery_probe_us =
                 esp_timer_get_time() + GNSS_RECOVERY_RETRY_INTERVAL_US;
+        }
+
+        /*
+         * Deliberately do not reboot here yet: the active OTA upload and
+         * activation state is not exposed to this GNSS module in this
+         * baseline. The final recovery reboot must be gated by OTA state
+         * and a persistent restart budget to prevent reboot loops.
+         */
+        if (!receiver_identified && !recovery_exhausted_reported &&
+            recovery_attempts >= GNSS_RECOVERY_MIN_RETRIES &&
+            esp_timer_get_time() - recovery_start_us >=
+                GNSS_RECOVERY_REBOOT_AFTER_US) {
+            ESP_LOGE(TAG,
+                     "GNSS recovery exhausted after 10 minutes and %"
+                     PRIu32 " retries; reboot deferred until OTA-safe "
+                     "restart budget integration", recovery_attempts);
+            recovery_exhausted_reported = true;
         }
 
         const int received = uart_read_bytes(uart_num,
